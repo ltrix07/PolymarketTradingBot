@@ -335,6 +335,41 @@ async def _iteration(cfg: dict, market_id: str, end_date_iso: str, cycle: int) -
     pos          = portfolio.get("active_position")
     seconds_left = _seconds_until_expiry(end_date_iso)
 
+    # ── 1.5. EXPIRY SETTLEMENT ──────────────────────────────────────────────────
+    if pos is not None and seconds_left <= 0:
+        side = pos["side"]
+        try:
+            last_price = await fetch_last_trade_price_async(cfg, market_id)
+        except Exception:
+            last_price = 0.5
+
+        if last_price is None:
+            last_price = 0.5
+
+        if last_price > 0.9:
+            yes_won = True
+        elif last_price < 0.1:
+            yes_won = False
+        else:
+            # Рынок закрыт, но оракул еще не дал результат (цена болтается посередине).
+            # Просто ждем и НЕ идем на Шаг 2, чтобы не получать 404 ошибки от стакана.
+            print(f"  [{cycle:>4}]  {market_id[:12]}…  Waiting for Oracle resolution...")
+            save_state(state, cfg)
+            return
+
+        result = "WIN" if (side == "YES" and yes_won) or (side == "NO" and not yes_won) else "LOSS"
+        state  = close_position(state, last_price, result, cfg)
+        trade  = state["trade_history"][-1]
+        _print_close(
+            "EXPIRED",
+            pos["entry_price"],
+            trade["exit_price"],
+            trade["pnl"],
+            state["virtual_portfolio"]["balance_usd"],
+        )
+        save_state(state, cfg)
+        return
+
     # ── 2. PARALLEL FETCH ─────────────────────────────────────────────────────
     # market_id here is already the correct market: either position's own market
     # (routed by run_loop) or the currently discovered market (no position).
@@ -356,36 +391,6 @@ async def _iteration(cfg: dict, market_id: str, end_date_iso: str, cycle: int) -
     best_ask        = book["best_ask"]
     best_bid        = book["best_bid"]
     book_imbalance  = book.get("book_imbalance")
-
-    # ── 1.5. EXPIRY SETTLEMENT ─────────────────────────────────────────────────
-    # BUG FIX: moved here so best_bid/best_ask (from parallel fetch) are in scope
-    if pos is not None and seconds_left == 0:
-        side         = pos["side"]
-        last_price   = await fetch_last_trade_price_async(cfg, market_id)
-        if last_price is None:
-            last_price = (best_bid + best_ask) / 2  # BUG FIX: now in scope
-
-        if last_price > 0.9:
-            yes_won = True
-        elif last_price < 0.1:
-            yes_won = False
-        else:
-            # Still settling — retry next cycle
-            save_state(state, cfg)
-            return
-
-        result = "WIN" if (side == "YES" and yes_won) or (side == "NO" and not yes_won) else "LOSS"
-        state  = close_position(state, last_price, result, cfg)
-        trade  = state["trade_history"][-1]
-        _print_close(
-            "EXPIRED",
-            pos["entry_price"],
-            trade["exit_price"],
-            trade["pnl"],
-            state["virtual_portfolio"]["balance_usd"],
-        )
-        save_state(state, cfg)
-        return
 
     # ── 3. ATR ────────────────────────────────────────────────────────────────
     atr_period     = cfg.get("risk_management", {}).get("atr_period", 14)
