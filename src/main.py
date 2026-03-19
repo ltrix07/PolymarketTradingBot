@@ -1,0 +1,464 @@
+"""
+main.py — Polymarket Paper Trading Bot entry point (async).
+
+Key improvements over v1:
+  - Full asyncio event loop: Binance + Polymarket fetched in parallel via asyncio.gather().
+  - BUG FIX: When a position is open, the bot locks onto that position's market for
+    SL/TP checks and expiry monitoring. Market discovery is SKIPPED while a position
+    is active — the bot no longer drifts to a new market and "lose" the open trade.
+  - ATR-based dynamic SL/TP: thresholds adapt to BTC volatility each cycle.
+  - Trailing stop: ratchets upward as the position gains value.
+  - Order book imbalance and RSI confirmation shown in status line.
+"""
+
+import asyncio
+import logging
+import argparse
+from datetime import datetime, timezone
+import yaml
+import os
+
+import httpx
+
+from fetcher import (
+    find_active_market_id_async,
+    fetch_binance_klines_async,
+    fetch_polymarket_book_async,
+    fetch_last_trade_price_async,
+)
+from strategy import generate_signal, get_macd_state
+from risk import (
+    check_sl_tp,
+    should_open_trade,
+    calculate_position_size,
+    update_halt_if_needed,
+    calculate_atr,
+    normalize_atr,
+    update_trailing_stop,
+    compute_dynamic_sl_tp,
+)
+from execution import (
+    load_state,
+    save_state,
+    reset_daily_pnl_if_needed,
+    open_position,
+    close_position,
+)
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%SZ",
+)
+log = logging.getLogger(__name__)
+log.setLevel(logging.INFO)
+
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "config.yaml")
+
+
+class _MarketUnavailableError(Exception):
+    """Raised when the CLOB returns 404 for a discovered market token.
+    Signals run_loop to discard the current market_info and re-run discovery.
+    """
+
+
+# ── ANSI colours ──────────────────────────────────────────────────────────────
+_G  = "\033[32m"
+_R  = "\033[31m"
+_Y  = "\033[33m"
+_C  = "\033[36m"
+_W  = "\033[37m"
+_B  = "\033[1m"
+_RS = "\033[0m"
+
+
+def _bar(char: str = "─", width: int = 52) -> str:
+    return char * width
+
+
+# ── Display helpers ───────────────────────────────────────────────────────────
+
+def _print_open(
+    side: str, entry: float, size: float, balance: float,
+    expires_in: float, market_slug: str,
+    fill_pct: float, sl_pct: float, tp_pct: float,
+) -> None:
+    side_label = f"{_G}▲  LONG  YES{_RS}" if side == "YES" else f"{_R}▼  SHORT  NO{_RS}"
+    fill_str   = f"  {_Y}fill {fill_pct*100:.0f}%{_RS}" if fill_pct < 0.999 else ""
+    print(f"\n{_B}{_C}{_bar('═')}{_RS}")
+    print(f"  {_B}POSITION OPENED{_RS}  {side_label}{fill_str}")
+    print(f"{_C}{_bar()}{_RS}")
+    print(f"  Market  {_W}{market_slug}{_RS}")
+    print(f"  Entry   {_B}{entry:.4f}{_RS}   Size  {_B}${size:.2f}{_RS}")
+    print(f"  SL      {_R}{sl_pct*100:.1f}%{_RS}   TP  {_G}{tp_pct*100:.1f}%{_RS}  (dynamic)")
+    print(f"  Balance {_B}${balance:.2f}{_RS}  after deduction")
+    print(f"  Expires in {_B}{expires_in:.0f}s{_RS}")
+    print(f"{_C}{_bar('═')}{_RS}\n")
+
+
+def _print_close(
+    trigger: str, entry: float, exit_price: float,
+    pnl: float, balance: float, is_trailing: bool = False,
+) -> None:
+    is_win  = trigger == "TP" or pnl > 0
+    colour  = _G if is_win else _R
+    icon    = "✔" if is_win else "✘"
+    if trigger == "TP":
+        label = "TAKE PROFIT"
+    elif trigger == "SL":
+        label = "STOP LOSS (trailing)" if is_trailing else "STOP LOSS"
+    else:
+        label = "EXPIRED"
+    pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+
+    print(f"\n{_B}{colour}{_bar('═')}{_RS}")
+    print(f"  {icon}  {_B}{colour}{label}{_RS}  {'WIN' if is_win else 'LOSS'}")
+    print(f"{colour}{_bar()}{_RS}")
+    print(f"  Entry   {_W}{entry:.4f}{_RS}  →  Exit  {_B}{exit_price:.4f}{_RS}")
+    print(f"  PnL     {_B}{colour}{pnl_str}{_RS}")
+    print(f"  Balance {_B}${balance:.2f}{_RS}")
+    print(f"{colour}{_bar('═')}{_RS}\n")
+
+
+def _print_status(
+    token_short: str, ask: float, bid: float,
+    expires_in: float, balance: float, cycle: int,
+    macd_state: dict | None = None, source: str = "?",
+    can_trade: bool = True, book_imbalance: float | None = None,
+    trailing_stop: float | None = None,
+) -> None:
+    spread = ask - bid
+
+    if macd_state and macd_state["diff"] is not None:
+        diff   = macd_state["diff"]
+        arrow  = f"{_G}▲{_RS}" if diff > 0 else f"{_R}▼{_RS}"
+        macd_s = f"  macd {arrow}{abs(diff):.5f}"
+    else:
+        macd_s = f"  macd {_W}--{_RS}"
+
+    trade_s = "" if can_trade else f"  {_Y}wait{_RS}"
+
+    imb_s = ""
+    if book_imbalance is not None:
+        imb_col = _G if book_imbalance > 0.55 else (_R if book_imbalance < 0.45 else _W)
+        imb_s   = f"  imb {imb_col}{book_imbalance:.2f}{_RS}"
+
+    trail_s = ""
+    if trailing_stop is not None:
+        trail_s = f"  trail {_Y}{trailing_stop:.4f}{_RS}"
+
+    print(
+        f"  [{cycle:>4}]  {_W}{token_short}…{_RS}"
+        f"  ask {_B}{ask:.4f}{_RS}  bid {_B}{bid:.4f}{_RS}"
+        f"  spread {spread:.4f}"
+        f"  exp {expires_in:.0f}s"
+        f"  src {_W}{source}{_RS}"
+        f"{macd_s}{imb_s}{trail_s}{trade_s}"
+        f"  bal ${balance:.2f}"
+    )
+
+
+# ── Config & utilities ────────────────────────────────────────────────────────
+
+def load_config(path=None) -> dict:
+    resolved = os.path.abspath(
+        path if path else os.path.join(os.path.dirname(__file__), "..", "config.yaml")
+    )
+    with open(resolved, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def _seconds_until_expiry(end_date_iso: str) -> float:
+    if not end_date_iso:
+        return 0.0
+    end_dt = datetime.fromisoformat(end_date_iso)
+    if end_dt.tzinfo is None:
+        end_dt = end_dt.replace(tzinfo=timezone.utc)
+    return max(0.0, (end_dt - datetime.now(timezone.utc)).total_seconds())
+
+
+async def _refresh_market_async(
+    cfg: dict,
+    current_token_id: str | None,
+    skip_token_ids: set | None = None,
+) -> dict | None:
+    try:
+        market_info = await find_active_market_id_async(cfg, skip_token_ids=skip_token_ids)
+        if market_info["token_id"] != current_token_id:
+            slug = market_info.get("slug", market_info["token_id"][:20])
+            print(
+                f"\n  {_C}◉  Market{_RS}  {_B}{slug}{_RS}"
+                f"  expires {market_info['end_date_iso']}"
+            )
+        return market_info
+    except Exception as exc:
+        log.warning("Discovery failed: %s", exc)
+        return None
+
+
+# ── Main async loop ───────────────────────────────────────────────────────────
+
+async def run_loop(cfg: dict) -> None:
+    poll_interval   = cfg["market"]["polling_interval_seconds"]
+    min_expiry_sec  = cfg["risk_management"]["min_time_before_expiry_sec"]
+
+    atr_mode   = "ATR-dynamic" if cfg["risk_management"].get("use_atr_dynamic", True) else "fixed"
+    trail_mode = f"trailing {'✓' if cfg['risk_management'].get('trailing_stop_enabled', True) else '✗'}"
+
+    print(f"\n{_B}{_C}{_bar('═')}{_RS}")
+    print(f"  {_B}POLYMARKET PAPER TRADING BOT  [async]{_RS}")
+    print(f"{_C}{_bar()}{_RS}")
+    print(
+        f"  SL {cfg['risk_management']['stop_loss_pct']*100:.0f}%  "
+        f"TP {cfg['risk_management']['take_profit_pct']*100:.0f}%  "
+        f"Max daily loss {cfg['risk_management']['max_daily_loss_pct']*100:.0f}%  "
+        f"Size {cfg['risk_management']['position_size_pct']*100:.0f}%"
+    )
+    print(f"  Risk: {_C}{atr_mode}{_RS}  {_C}{trail_mode}{_RS}")
+    print(f"{_C}{_bar('═')}{_RS}\n")
+
+    _unavailable_tokens: set[str] = set()
+
+    market_info = await _refresh_market_async(cfg, current_token_id=None)
+    if market_info is None:
+        log.warning("No active market at startup — will retry each cycle.")
+
+    cycle = 0
+    while True:
+        cycle += 1
+        try:
+            # Peek at state to decide market routing for this cycle
+            state = load_state(cfg)
+            pos   = state["virtual_portfolio"].get("active_position")
+
+            if pos is not None:
+                # ── BUG FIX ──────────────────────────────────────────────────
+                # Active position: always monitor the position's own market.
+                # Do NOT run discovery — switching markets mid-position causes
+                # SL/TP checks to use prices from the wrong order book, and
+                # the trade will never be settled in the emulator.
+                await _iteration(
+                    cfg,
+                    pos["market_id"],
+                    pos.get("market_end_date_iso", ""),
+                    cycle,
+                )
+            else:
+                # No position: refresh market discovery when current is stale/expired
+                if (
+                    market_info is None
+                    or _seconds_until_expiry(market_info["end_date_iso"]) < min_expiry_sec
+                ):
+                    market_info = await _refresh_market_async(
+                        cfg,
+                        market_info["token_id"] if market_info else None,
+                        skip_token_ids=_unavailable_tokens,
+                    )
+
+                if market_info is not None:
+                    # Fresh valid market — clear the blacklist
+                    _unavailable_tokens.clear()
+                    await _iteration(
+                        cfg,
+                        market_info["token_id"],
+                        market_info["end_date_iso"],
+                        cycle,
+                    )
+                else:
+                    log.warning("No active market — skipping cycle %d.", cycle)
+
+        except _MarketUnavailableError as exc:
+            # CLOB returned 404 — the discovered market token isn't tradeable yet.
+            # Blacklist this token so re-discovery skips it, then wait for next round.
+            bad_token = str(exc)
+            if bad_token:
+                _unavailable_tokens.add(bad_token)
+            market_info = None
+            log.warning(
+                "Market unavailable on CLOB — blacklisting token, waiting 30 s for next round."
+            )
+            await asyncio.sleep(30)
+            continue
+        except KeyboardInterrupt:
+            print(f"\n{_Y}  Bot stopped.{_RS}\n")
+            break
+        except Exception as exc:
+            log.error("Iteration error: %s", exc)
+
+        await asyncio.sleep(poll_interval)
+
+
+# ── Single iteration ──────────────────────────────────────────────────────────
+
+async def _iteration(cfg: dict, market_id: str, end_date_iso: str, cycle: int) -> None:
+    # ── 1. STATE ──────────────────────────────────────────────────────────────
+    state     = load_state(cfg)
+    state     = reset_daily_pnl_if_needed(state)
+    portfolio = state["virtual_portfolio"]
+    portfolio = update_halt_if_needed(portfolio, cfg)
+    state["virtual_portfolio"] = portfolio
+
+    pos          = portfolio.get("active_position")
+    seconds_left = _seconds_until_expiry(end_date_iso)
+
+    # ── 1.5. EXPIRY SETTLEMENT ──────────────────────────────────────────────────
+    if pos is not None and seconds_left == 0:
+        side         = pos["side"]
+        last_price   = await fetch_last_trade_price_async(cfg, market_id)
+        if last_price is None:
+            last_price = (best_bid + best_ask) / 2
+
+        if last_price > 0.9:
+            yes_won = True
+        elif last_price < 0.1:
+            yes_won = False
+        else:
+            # Still settling — retry next cycle
+            save_state(state, cfg)
+            return
+
+        result = "WIN" if (side == "YES" and yes_won) or (side == "NO" and not yes_won) else "LOSS"
+        state  = close_position(state, last_price, result, cfg)
+        trade  = state["trade_history"][-1]
+        _print_close(
+            "EXPIRED",
+            pos["entry_price"],
+            trade["exit_price"],
+            trade["pnl"],
+            state["virtual_portfolio"]["balance_usd"],
+        )
+        save_state(state, cfg)
+        return
+
+    # ── 2. PARALLEL FETCH ─────────────────────────────────────────────────────
+    # market_id here is already the correct market: either position's own market
+    # (routed by run_loop) or the currently discovered market (no position).
+    try:
+        candles, book = await asyncio.gather(
+            fetch_binance_klines_async(cfg),
+            fetch_polymarket_book_async(cfg, market_id),
+        )
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            log.warning("CLOB 404 for token %s — market not yet tradeable.", market_id)
+            raise _MarketUnavailableError(market_id) from exc
+        log.warning("API fetch failed: %s", exc)
+        return
+    except Exception as exc:
+        log.warning("API fetch failed: %s", exc)
+        return
+
+    best_ask        = book["best_ask"]
+    best_bid        = book["best_bid"]
+    book_imbalance  = book.get("book_imbalance")
+
+    # ── 3. ATR ────────────────────────────────────────────────────────────────
+    atr_period     = cfg.get("risk_management", {}).get("atr_period", 14)
+    atr_raw        = calculate_atr(candles, period=atr_period)
+    last_close     = float(candles[-1]["close"]) if candles else None
+    atr_normalized = normalize_atr(atr_raw, last_close) if atr_raw else None
+
+    # ── 4. STATUS LINE ────────────────────────────────────────────────────────
+    macd_state  = get_macd_state(candles, cfg)
+    can_trade   = should_open_trade(portfolio, seconds_left, cfg)
+    trailing    = pos.get("trailing_stop_price") if pos else None
+    _print_status(
+        market_id[:12], best_ask, best_bid, seconds_left,
+        portfolio["balance_usd"], cycle,
+        macd_state=macd_state, source=f"bnb{len(candles)}",
+        can_trade=can_trade, book_imbalance=book_imbalance,
+        trailing_stop=trailing,
+    )
+
+    if portfolio.get("trading_halted_until"):
+        log.warning("Trading halted until %s", portfolio["trading_halted_until"])
+
+    # ── 6. TRAILING STOP UPDATE ───────────────────────────────────────────────
+    if pos is not None:
+        portfolio["active_position"] = update_trailing_stop(
+            pos, best_bid, best_ask, atr_normalized, cfg
+        )
+        state["virtual_portfolio"] = portfolio
+
+    # ── 7. SL / TP CHECK ──────────────────────────────────────────────────────
+    use_sl_tp = cfg.get("risk_management", {}).get("use_sl_tp", True)
+    if use_sl_tp and portfolio.get("active_position") is not None:
+        trigger = check_sl_tp(portfolio, best_bid, best_ask, cfg)
+        if trigger:
+            pos    = portfolio["active_position"]
+            exit_p = best_bid if pos["side"] == "YES" else (1.0 - best_ask)
+            state  = close_position(state, exit_p, trigger, cfg, book_data=book)
+            trade  = state["trade_history"][-1]
+            is_trailing = (
+                trigger == "SL"
+                and pos.get("trailing_stop_price") is not None
+                and exit_p <= pos["trailing_stop_price"]
+            )
+            _print_close(
+                trigger,
+                pos["entry_price"],
+                trade["exit_price"],
+                trade["pnl"],
+                state["virtual_portfolio"]["balance_usd"],
+                is_trailing=is_trailing,
+            )
+            save_state(state, cfg)
+            return
+
+    # ── 8. OPEN TRADE ─────────────────────────────────────────────────────────
+    if not should_open_trade(portfolio, seconds_left, cfg):
+        save_state(state, cfg)
+        return
+
+    signal = generate_signal(candles, cfg, book_data=book)
+    if signal is None:
+        save_state(state, cfg)
+        return
+
+    side        = "YES" if signal == "BUY_YES" else "NO"
+    size_usd    = calculate_position_size(portfolio, cfg)
+    entry_price = best_ask if side == "YES" else (1.0 - best_bid)
+
+    if size_usd < 1.0:
+        log.critical("Balance too low ($%.2f). Stopping.", portfolio["balance_usd"])
+        raise SystemExit(1)
+
+    # Compute dynamic SL/TP from current ATR before opening
+    sl_pct, tp_pct = compute_dynamic_sl_tp(atr_normalized, cfg)
+
+    cfg["_current_market_end_date_iso"] = end_date_iso
+    state = open_position(
+        state, side, entry_price, size_usd, market_id, cfg,
+        book_data=book, sl_pct=sl_pct, tp_pct=tp_pct,
+    )
+    save_state(state, cfg)
+
+    new_pos = state["virtual_portfolio"]["active_position"]
+    _print_open(
+        side,
+        new_pos["entry_price"],
+        new_pos["size_usd"],
+        state["virtual_portfolio"]["balance_usd"],
+        seconds_left,
+        market_id[:24],
+        new_pos.get("fill_pct", 1.0),
+        new_pos.get("sl_pct", sl_pct),
+        new_pos.get("tp_pct", tp_pct),
+    )
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Polymarket Paper Trading Bot")
+    parser.add_argument("--config", "-c", default=None,
+                        help="Path to config YAML (default: ../config.yaml)")
+    args = parser.parse_args()
+    cfg  = load_config(args.config)
+    asyncio.run(run_loop(cfg))
+
+
+if __name__ == "__main__":
+    main()
