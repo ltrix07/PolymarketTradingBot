@@ -72,6 +72,6 @@ simulation:
 endpoints:
   polymarket_clob: "https://clob.polymarket.com"
   binance_v3: "https://api.binance.com/api/v3"
-  # proxy: "http://user:pass@host:port"   # Раскомментируй для Polymarket (Cloudflare bypass)
-  telegram_bot_token: ""   # Вставь токен от @BotFather, например: "7123456789:AAFxxx..."
-  telegram_chat_id: ""     # Твой chat_id (число), например: "123456789"
+  proxy: "http://skotarenko13802NDV:mrmcIFWs2S@194.35.226.36:50100"   # Раскомментируй для Polymarket (Cloudflare bypass)
+  telegram_bot_token: "8602019058:AAFaJkXq2Uj8OyxC4lJ5dze1gf0fp5KDr6w"   # Вставь токен от @BotFather, например: "7123456789:AAFxxx..."
+  telegram_chat_id: "324521546"     # Твой chat_id (число), например: "123456789"
