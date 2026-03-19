@@ -45,7 +45,7 @@ def calculate_atr(candles: list[dict], period: int = 14) -> float | None:
         return None
 
 
-def normalize_atr(atr_raw: float, last_close: float | None = None) -> float:
+def normalize_atr(atr_raw: float, last_close: float | None = None, cfg: dict | None = None) -> float:  # BUG FIX: accept cfg to read configurable fallback price
     """Scale BTC USD ATR to Polymarket token price units (0-1 scale).
 
     Uses last_close as BTC reference price when available; falls back to $90,000.
@@ -55,7 +55,8 @@ def normalize_atr(atr_raw: float, last_close: float | None = None) -> float:
 
     Clamped to [0.005, 0.10] to prevent extreme SL/TP values.
     """
-    btc_price = last_close if (last_close and last_close > 1000) else 90_000.0
+    fallback_price = (cfg or {}).get("risk_management", {}).get("btc_price_fallback", 90_000.0)  # BUG FIX: read from config, not hardcoded
+    btc_price = last_close if (last_close and last_close > 1000) else fallback_price  # BUG FIX: use config-driven fallback
     normalized = (atr_raw / btc_price) * 9.0
     return max(0.005, min(normalized, 0.10))
 

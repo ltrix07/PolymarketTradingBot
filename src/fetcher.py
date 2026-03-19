@@ -94,7 +94,8 @@ async def find_active_market_id_async(cfg: dict, skip_token_ids: set | None = No
         "Referer": "https://polymarket.com/"
     }
     
-    async with httpx.AsyncClient(timeout=5.0, headers=headers) as client:
+    proxy_url = cfg.get("endpoints", {}).get("proxy")
+    async with httpx.AsyncClient(timeout=5.0, headers=headers, proxy=proxy_url) as client:
         for query in search_queries:
             base_params = {
                 "active": "true",
@@ -208,7 +209,7 @@ async def find_active_market_id_async(cfg: dict, skip_token_ids: set | None = No
     clob_base = cfg["endpoints"]["polymarket_clob"]
     candidates.sort(key=lambda m: m["seconds_left"], reverse=True)
 
-    async with httpx.AsyncClient(timeout=3.0) as clob_client:
+    async with httpx.AsyncClient(timeout=3.0, proxy=proxy_url) as clob_client:
         for candidate in candidates:
             try:
                 r = await clob_client.get(
@@ -265,8 +266,9 @@ async def fetch_polymarket_book_async(cfg: dict, token_id: str) -> dict:
     base_url = cfg["endpoints"]["polymarket_clob"]
     url = f"{base_url}/book"
     depth_levels = cfg.get("strategy", {}).get("order_book", {}).get("depth_levels", 5)
+    proxy_url = cfg.get("endpoints", {}).get("proxy")
 
-    async with httpx.AsyncClient(timeout=5.0) as client:
+    async with httpx.AsyncClient(timeout=5.0, proxy=proxy_url) as client:
         response = await client.get(url, params={"token_id": token_id})
         response.raise_for_status()
 
@@ -340,8 +342,9 @@ async def fetch_last_trade_price_async(cfg: dict, token_id: str) -> float | None
     """
     base_url = cfg["endpoints"]["polymarket_clob"]
     url = f"{base_url}/last-trade-price"
+    proxy_url = cfg.get("endpoints", {}).get("proxy")
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with httpx.AsyncClient(timeout=5.0, proxy=proxy_url) as client:
             response = await client.get(url, params={"token_id": token_id})
             response.raise_for_status()
         data = response.json()

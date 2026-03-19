@@ -14,6 +14,7 @@ Key improvements over v1:
 import asyncio
 import logging
 import argparse
+import sys
 from datetime import datetime, timezone
 import yaml
 import os
@@ -295,6 +296,37 @@ async def run_loop(cfg: dict) -> None:
 async def _iteration(cfg: dict, market_id: str, end_date_iso: str, cycle: int) -> None:
     # ── 1. STATE ──────────────────────────────────────────────────────────────
     state     = load_state(cfg)
+
+    initial = float(cfg.get("risk_management", {}).get("initial_balance_usd", 1000.0))
+    current = state["virtual_portfolio"].get("balance_usd", 0.0)
+    if current < initial * 0.05:
+        log.error(
+            "\033[1m\033[31mCRITICAL: Слито более 95%% депозита "
+            "(остаток $%.2f). Остановка бота.\033[0m",
+            current,
+        )
+        token         = cfg.get("endpoints", {}).get("telegram_bot_token")
+        chat_id       = cfg.get("endpoints", {}).get("telegram_chat_id")
+        proxy         = cfg.get("endpoints", {}).get("proxy")
+        strategy_name = cfg.get("strategy", {}).get("name", "Unknown Bot")
+        if token and chat_id:
+            message = (
+                f"🚨 СТОП-КРАН: Бот [{strategy_name}] слил более 95% депозита. "
+                f"Остаток: ${current:.2f}. Скрипт остановлен."
+            )
+            try:
+                client_kwargs = {"timeout": 10.0}
+                if proxy:
+                    client_kwargs["proxy"] = proxy
+                with httpx.Client(**client_kwargs) as client:
+                    client.post(
+                        f"https://api.telegram.org/bot{token}/sendMessage",
+                        json={"chat_id": chat_id, "text": message},
+                    )
+            except Exception as tg_exc:
+                log.warning("Telegram notification failed: %s", tg_exc)
+        sys.exit(0)
+
     state     = reset_daily_pnl_if_needed(state)
     portfolio = state["virtual_portfolio"]
     portfolio = update_halt_if_needed(portfolio, cfg)
@@ -302,35 +334,6 @@ async def _iteration(cfg: dict, market_id: str, end_date_iso: str, cycle: int) -
 
     pos          = portfolio.get("active_position")
     seconds_left = _seconds_until_expiry(end_date_iso)
-
-    # ── 1.5. EXPIRY SETTLEMENT ──────────────────────────────────────────────────
-    if pos is not None and seconds_left == 0:
-        side         = pos["side"]
-        last_price   = await fetch_last_trade_price_async(cfg, market_id)
-        if last_price is None:
-            last_price = (best_bid + best_ask) / 2
-
-        if last_price > 0.9:
-            yes_won = True
-        elif last_price < 0.1:
-            yes_won = False
-        else:
-            # Still settling — retry next cycle
-            save_state(state, cfg)
-            return
-
-        result = "WIN" if (side == "YES" and yes_won) or (side == "NO" and not yes_won) else "LOSS"
-        state  = close_position(state, last_price, result, cfg)
-        trade  = state["trade_history"][-1]
-        _print_close(
-            "EXPIRED",
-            pos["entry_price"],
-            trade["exit_price"],
-            trade["pnl"],
-            state["virtual_portfolio"]["balance_usd"],
-        )
-        save_state(state, cfg)
-        return
 
     # ── 2. PARALLEL FETCH ─────────────────────────────────────────────────────
     # market_id here is already the correct market: either position's own market
@@ -354,11 +357,41 @@ async def _iteration(cfg: dict, market_id: str, end_date_iso: str, cycle: int) -
     best_bid        = book["best_bid"]
     book_imbalance  = book.get("book_imbalance")
 
+    # ── 1.5. EXPIRY SETTLEMENT ─────────────────────────────────────────────────
+    # BUG FIX: moved here so best_bid/best_ask (from parallel fetch) are in scope
+    if pos is not None and seconds_left == 0:
+        side         = pos["side"]
+        last_price   = await fetch_last_trade_price_async(cfg, market_id)
+        if last_price is None:
+            last_price = (best_bid + best_ask) / 2  # BUG FIX: now in scope
+
+        if last_price > 0.9:
+            yes_won = True
+        elif last_price < 0.1:
+            yes_won = False
+        else:
+            # Still settling — retry next cycle
+            save_state(state, cfg)
+            return
+
+        result = "WIN" if (side == "YES" and yes_won) or (side == "NO" and not yes_won) else "LOSS"
+        state  = close_position(state, last_price, result, cfg)
+        trade  = state["trade_history"][-1]
+        _print_close(
+            "EXPIRED",
+            pos["entry_price"],
+            trade["exit_price"],
+            trade["pnl"],
+            state["virtual_portfolio"]["balance_usd"],
+        )
+        save_state(state, cfg)
+        return
+
     # ── 3. ATR ────────────────────────────────────────────────────────────────
     atr_period     = cfg.get("risk_management", {}).get("atr_period", 14)
     atr_raw        = calculate_atr(candles, period=atr_period)
     last_close     = float(candles[-1]["close"]) if candles else None
-    atr_normalized = normalize_atr(atr_raw, last_close) if atr_raw else None
+    atr_normalized = normalize_atr(atr_raw, last_close, cfg) if atr_raw else None  # BUG FIX: pass cfg for configurable BTC price fallback
 
     # ── 4. STATUS LINE ────────────────────────────────────────────────────────
     macd_state  = get_macd_state(candles, cfg)

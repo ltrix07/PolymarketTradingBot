@@ -10,6 +10,7 @@ Signal fires when: MACD crossover AND at least one of (RSI ok OR book ok).
 This reduces false signals while keeping the bot responsive.
 """
 
+import logging
 import pandas as pd
 import pandas_ta as ta
 
@@ -138,11 +139,18 @@ def generate_signal(
         return None
 
     rsi_ok  = _compute_rsi_confirmation(df, cfg, macd_signal)
+    book_available = book_data is not None  # BUG FIX: track whether book fetch succeeded
+    if not book_available:
+        logging.warning("Order book unavailable — falling back to RSI-only confirmation")  # BUG FIX: warn on silent degradation
     book_ok = _compute_book_confirmation(book_data, cfg, macd_signal)
 
-    # Need at least one confirmation beyond MACD
-    if not (rsi_ok or book_ok):
-        return None
+    # BUG FIX: when book is available require both confirmations; RSI-only only when book is absent
+    if book_available:
+        if not (rsi_ok and book_ok):
+            return None
+    else:
+        if not rsi_ok:
+            return None
 
     return macd_signal
 
