@@ -338,6 +338,13 @@ async def _iteration(cfg: dict, market_id: str, end_date_iso: str, cycle: int) -
     # ── 1.5. EXPIRY SETTLEMENT ──────────────────────────────────────────────────
     if pos is not None and seconds_left <= 0:
         side = pos["side"]
+
+        # Вычисляем, сколько секунд прошло с момента экспирации
+        end_dt = datetime.fromisoformat(end_date_iso.replace("Z", "+00:00"))
+        if end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=timezone.utc)
+        time_since_expiry = (datetime.now(timezone.utc) - end_dt).total_seconds()
+
         try:
             last_price = await fetch_last_trade_price_async(cfg, market_id)
         except Exception:
@@ -348,20 +355,24 @@ async def _iteration(cfg: dict, market_id: str, end_date_iso: str, cycle: int) -
 
         if last_price > 0.9:
             yes_won = True
+            result = "WIN" if side == "YES" else "LOSS"
         elif last_price < 0.1:
             yes_won = False
+            result = "WIN" if side == "NO" else "LOSS"
         else:
-            # Рынок закрыт, но оракул еще не дал результат (цена болтается посередине).
-            # Просто ждем и НЕ идем на Шаг 2, чтобы не получать 404 ошибки от стакана.
-            print(f"  [{cycle:>4}]  {market_id[:12]}…  Waiting for Oracle resolution...")
-            save_state(state, cfg)
-            return
+            if time_since_expiry > 1800:  # 30 минут таймаут
+                print(f"  [{cycle:>4}]  {market_id[:12]}…  Oracle timeout (30m). Force closing (Refund).")
+                last_price = pos["entry_price"]  # Закрываем по цене входа (PnL = 0)
+                result = "DRAW"
+            else:
+                print(f"  [{cycle:>4}]  {market_id[:12]}…  Waiting for Oracle... ({int(time_since_expiry)}s)")
+                save_state(state, cfg)
+                return
 
-        result = "WIN" if (side == "YES" and yes_won) or (side == "NO" and not yes_won) else "LOSS"
         state  = close_position(state, last_price, result, cfg)
         trade  = state["trade_history"][-1]
         _print_close(
-            "EXPIRED",
+            f"EXPIRED {result}",
             pos["entry_price"],
             trade["exit_price"],
             trade["pnl"],
