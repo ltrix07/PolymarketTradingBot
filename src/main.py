@@ -26,6 +26,7 @@ from fetcher import (
     fetch_binance_klines_async,
     fetch_polymarket_book_async,
     fetch_last_trade_price_async,
+    PolymarketBookFeed,
 )
 from strategy import generate_signal, get_macd_state
 from risk import (
@@ -57,6 +58,19 @@ log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "config.yaml")
+
+# WS: strategies that activate the WebSocket order book transport
+WS_STRATEGY_NAMES = {"Поздний Снайпер", "Ловец паники"}
+
+# WS: check websockets library availability once at import time
+try:
+    import websockets as _websockets_probe  # noqa: F401
+    _WS_AVAILABLE = True
+except ImportError:
+    _WS_AVAILABLE = False
+
+# WS: tracks which token the feed is currently subscribed to
+_ws_active_token: str | None = None
 
 
 class _MarketUnavailableError(Exception):
@@ -222,6 +236,16 @@ async def run_loop(cfg: dict) -> None:
 
     _unavailable_tokens: set[str] = set()
 
+    # WS: determine whether this strategy should use the WebSocket book feed
+    global _ws_active_token
+    strategy_name = cfg.get("strategy", {}).get("name", "")
+    use_ws = strategy_name in WS_STRATEGY_NAMES
+    if use_ws and not _WS_AVAILABLE:
+        log.warning("websockets not installed — book feed will use HTTP fallback")
+        use_ws = False
+    # WS: create feed instance (not started yet — token_id unknown until discovery)
+    book_feed: PolymarketBookFeed | None = PolymarketBookFeed() if use_ws else None
+
     market_info = await _refresh_market_async(cfg, current_token_id=None)
     if market_info is None:
         log.warning("No active market at startup — will retry each cycle.")
@@ -240,11 +264,19 @@ async def run_loop(cfg: dict) -> None:
                 # Do NOT run discovery — switching markets mid-position causes
                 # SL/TP checks to use prices from the wrong order book, and
                 # the trade will never be settled in the emulator.
+                # WS: restart feed if the active position's market changed
+                if use_ws and book_feed is not None:
+                    if pos["market_id"] != _ws_active_token:
+                        await book_feed.stop()
+                        await book_feed.start(pos["market_id"], cfg)
+                        _ws_active_token = pos["market_id"]
                 await _iteration(
                     cfg,
                     pos["market_id"],
                     pos.get("market_end_date_iso", ""),
                     cycle,
+                    book_feed=book_feed,
+                    use_ws=use_ws,
                 )
             else:
                 # No position: refresh market discovery when current is stale/expired
@@ -261,11 +293,19 @@ async def run_loop(cfg: dict) -> None:
                 if market_info is not None:
                     # Fresh valid market — clear the blacklist
                     _unavailable_tokens.clear()
+                    # WS: restart feed if discovered market token changed
+                    if use_ws and book_feed is not None:
+                        if market_info["token_id"] != _ws_active_token:
+                            await book_feed.stop()
+                            await book_feed.start(market_info["token_id"], cfg)
+                            _ws_active_token = market_info["token_id"]
                     await _iteration(
                         cfg,
                         market_info["token_id"],
                         market_info["end_date_iso"],
                         cycle,
+                        book_feed=book_feed,
+                        use_ws=use_ws,
                     )
                 else:
                     log.warning("No active market — skipping cycle %d.", cycle)
@@ -284,6 +324,9 @@ async def run_loop(cfg: dict) -> None:
             continue
         except KeyboardInterrupt:
             print(f"\n{_Y}  Bot stopped.{_RS}\n")
+            # WS: stop feed on shutdown
+            if use_ws and book_feed is not None:
+                await book_feed.stop()
             break
         except Exception as exc:
             log.error("Iteration error: %s", exc)
@@ -293,7 +336,10 @@ async def run_loop(cfg: dict) -> None:
 
 # ── Single iteration ──────────────────────────────────────────────────────────
 
-async def _iteration(cfg: dict, market_id: str, end_date_iso: str, cycle: int) -> None:
+async def _iteration(
+    cfg: dict, market_id: str, end_date_iso: str, cycle: int,
+    book_feed: "PolymarketBookFeed | None" = None, use_ws: bool = False,
+) -> None:
     # ── 1. STATE ──────────────────────────────────────────────────────────────
     state     = load_state(cfg)
 
@@ -385,10 +431,26 @@ async def _iteration(cfg: dict, market_id: str, end_date_iso: str, cycle: int) -
     # market_id here is already the correct market: either position's own market
     # (routed by run_loop) or the currently discovered market (no position).
     try:
-        candles, book = await asyncio.gather(
-            fetch_binance_klines_async(cfg),
-            fetch_polymarket_book_async(cfg, market_id),
-        )
+        # WS: use WebSocket snapshot when available; fall back to HTTP otherwise
+        if use_ws and book_feed is not None:
+            ws_book = book_feed.get_latest()
+            if ws_book is not None:
+                candles = await fetch_binance_klines_async(cfg)
+                book = ws_book
+                book_source = "ws"
+            else:
+                # WebSocket not ready yet — fall back to HTTP
+                candles, book = await asyncio.gather(
+                    fetch_binance_klines_async(cfg),
+                    fetch_polymarket_book_async(cfg, market_id),
+                )
+                book_source = "http-fallback"
+        else:
+            candles, book = await asyncio.gather(
+                fetch_binance_klines_async(cfg),
+                fetch_polymarket_book_async(cfg, market_id),
+            )
+            book_source = "http"
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code == 404:
             log.warning("CLOB 404 for token %s — market not yet tradeable.", market_id)
@@ -416,7 +478,7 @@ async def _iteration(cfg: dict, market_id: str, end_date_iso: str, cycle: int) -
     _print_status(
         market_id[:12], best_ask, best_bid, seconds_left,
         portfolio["balance_usd"], cycle,
-        macd_state=macd_state, source=f"bnb{len(candles)}",
+        macd_state=macd_state, source=f"bnb{len(candles)}+{book_source}",
         can_trade=can_trade, book_imbalance=book_imbalance,
         trailing_stop=trailing,
     )

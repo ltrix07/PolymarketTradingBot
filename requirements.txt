@@ -6,3 +6,4 @@ PyYAML==6.0.2
 python-dateutil==2.9.0.post0
 pytz==2025.2
 tzdata==2025.2
+websockets>=12.0

@@ -17,9 +17,12 @@ Every request uses a strict 5-second timeout.
 import asyncio
 from datetime import datetime, timedelta, timezone
 import json
+import logging
 import re
 
 import httpx
+
+_log = logging.getLogger(__name__)
 
 
 def _parse_clob_token_ids(raw_value) -> list:
@@ -374,3 +377,212 @@ def fetch_polymarket_history(cfg: dict, token_id: str) -> list:
 
 def fetch_last_trade_price(cfg: dict, token_id: str) -> float | None:
     return asyncio.run(fetch_last_trade_price_async(cfg, token_id))
+
+
+# ── Real-time WebSocket order book feed ───────────────────────────────────────
+
+class PolymarketBookFeed:
+    """WebSocket-based real-time order book feed for Polymarket CLOB.
+
+    Maintains an up-to-date _state dict whose structure is identical to the
+    dict returned by fetch_polymarket_book_async(). Use get_latest() to read
+    the current snapshot from any coroutine.
+
+    Endpoint: wss://ws-subscriptions-clob.polymarket.com/ws/market
+
+    Handled event types:
+      "book"          — full order book snapshot (rebuilds local state)
+      "price_change"  — incremental delta updates
+      "best_bid_ask"  — direct best-price update (no full recompute needed)
+
+    A plaintext "PING" is sent every 10 seconds; "PONG" is silently ignored.
+    On any disconnect the listener reconnects automatically after 3 seconds.
+    """
+
+    _WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    _PING_INTERVAL = 10    # seconds between keepalive PINGs
+    _RECONNECT_DELAY = 3   # seconds before reconnect attempt
+
+    def __init__(self) -> None:
+        self._token_id: str | None = None
+        self._cfg: dict = {}
+        self._state: dict | None = None
+        self._bids: dict[str, float] = {}   # price_str -> size
+        self._asks: dict[str, float] = {}   # price_str -> size
+        self._task: asyncio.Task | None = None
+        self._running = False
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    async def start(self, token_id: str, cfg: dict) -> None:
+        """Connect and start the background WebSocket listener task."""
+        self._token_id = token_id
+        self._cfg = cfg
+        self._running = True
+        self._bids.clear()
+        self._asks.clear()
+        self._state = None
+        self._task = asyncio.create_task(self._listener_loop())
+
+    async def stop(self) -> None:
+        """Cancel the background listener task and release the connection."""
+        self._running = False
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+
+    def get_latest(self) -> dict | None:
+        """Return a shallow copy of the current _state snapshot, or None."""
+        return dict(self._state) if self._state is not None else None
+
+    # ── Internal state helpers ────────────────────────────────────────────────
+
+    def _depth_levels(self) -> int:
+        return (
+            self._cfg.get("strategy", {})
+            .get("order_book", {})
+            .get("depth_levels", 5)
+        )
+
+    def _recompute_state(self) -> None:
+        """Rebuild the full _state dict from the current bids/asks dicts.
+
+        Uses the same depth_levels / imbalance logic as
+        fetch_polymarket_book_async() so callers see an identical structure.
+        """
+        depth = self._depth_levels()
+        asks_sorted = sorted(
+            [{"price": float(p), "size": s} for p, s in self._asks.items() if s > 0],
+            key=lambda x: x["price"],
+        )
+        bids_sorted = sorted(
+            [{"price": float(p), "size": s} for p, s in self._bids.items() if s > 0],
+            key=lambda x: x["price"],
+            reverse=True,
+        )
+        if not asks_sorted or not bids_sorted:
+            return
+
+        top_asks = asks_sorted[:depth]
+        top_bids = bids_sorted[:depth]
+        ask_volume = sum(a["size"] for a in top_asks)
+        bid_volume = sum(b["size"] for b in top_bids)
+        total = ask_volume + bid_volume
+        book_imbalance = bid_volume / total if total > 0 else 0.5
+
+        self._state = {
+            "best_ask":       asks_sorted[0]["price"],
+            "best_bid":       bids_sorted[0]["price"],
+            "token_id":       self._token_id,
+            "ask_volume":     ask_volume,
+            "bid_volume":     bid_volume,
+            "book_imbalance": book_imbalance,
+            "top_asks":       top_asks,
+            "top_bids":       top_bids,
+        }
+
+    def _apply_book(self, data: dict) -> None:
+        """Rebuild full book from a 'book' event (full snapshot)."""
+        self._asks.clear()
+        self._bids.clear()
+        for entry in data.get("asks", []):
+            s = float(entry.get("size", 0))
+            if s > 0:
+                self._asks[str(entry.get("price", "0"))] = s
+        for entry in data.get("bids", []):
+            s = float(entry.get("size", 0))
+            if s > 0:
+                self._bids[str(entry.get("price", "0"))] = s
+        self._recompute_state()
+
+    def _apply_price_change(self, data: dict) -> None:
+        """Apply incremental delta updates from a 'price_change' event."""
+        for change in data.get("changes", []):
+            price = str(change.get("price", "0"))
+            size  = float(change.get("size", 0))
+            side  = change.get("side", "").lower()
+            if side == "ask":
+                if size == 0:
+                    self._asks.pop(price, None)
+                else:
+                    self._asks[price] = size
+            elif side == "bid":
+                if size == 0:
+                    self._bids.pop(price, None)
+                else:
+                    self._bids[price] = size
+        self._recompute_state()
+
+    def _apply_best_bid_ask(self, data: dict) -> None:
+        """Directly update best_bid / best_ask from a 'best_bid_ask' event."""
+        if self._state is None:
+            return
+        new_state = dict(self._state)
+        if "best_ask" in data:
+            new_state["best_ask"] = float(data["best_ask"])
+        if "best_bid" in data:
+            new_state["best_bid"] = float(data["best_bid"])
+        self._state = new_state
+
+    # ── Background listener ───────────────────────────────────────────────────
+
+    async def _listener_loop(self) -> None:
+        """Connect, subscribe, and dispatch incoming messages indefinitely.
+
+        The import of websockets is deferred so that the module loads even if
+        the library is not installed (the guard in main.py sets use_ws=False).
+        """
+        import websockets  # deferred — guarded by _WS_AVAILABLE in main.py
+
+        while self._running:
+            try:
+                async with websockets.connect(self._WS_URL) as ws:
+                    await ws.send(json.dumps({
+                        "assets_ids": [self._token_id],
+                        "type": "market",
+                        "custom_feature_enabled": True,
+                    }))
+
+                    loop = asyncio.get_running_loop()
+                    last_ping = loop.time()
+
+                    while self._running:
+                        elapsed      = loop.time() - last_ping
+                        recv_timeout = max(0.05, self._PING_INTERVAL - elapsed)
+
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=recv_timeout)
+                        except asyncio.TimeoutError:
+                            await ws.send("PING")
+                            last_ping = loop.time()
+                            continue
+
+                        if raw == "PONG":
+                            continue
+
+                        try:
+                            msg = json.loads(raw)
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+
+                        event_type = msg.get("event_type") or msg.get("type", "")
+                        if event_type == "book":
+                            self._apply_book(msg)
+                        elif event_type == "price_change":
+                            self._apply_price_change(msg)
+                        elif event_type == "best_bid_ask":
+                            self._apply_best_bid_ask(msg)
+
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                _log.warning(
+                    "PolymarketBookFeed disconnected (%s) — reconnecting in %ds",
+                    exc, self._RECONNECT_DELAY,
+                )
+                if self._running:
+                    await asyncio.sleep(self._RECONNECT_DELAY)
