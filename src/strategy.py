@@ -17,12 +17,20 @@ import pandas_ta as ta
 
 # ── Primary signal: MACD crossover ────────────────────────────────────────────
 
+def _get_macd_params(cfg: dict) -> tuple[int, int, int]:
+    """Extract MACD parameters supporting both nested and flat config layouts."""
+    strat = cfg.get("strategy", {})
+    params = strat.get("parameters", strat)
+    return (
+        int(params.get("fast_ema", 3)),
+        int(params.get("slow_ema", 15)),
+        int(params.get("signal_smoothing", 3)),
+    )
+
+
 def _compute_macd_signal(df: pd.DataFrame, cfg: dict) -> str | None:
     """Return 'BUY_YES', 'BUY_NO', or None based on MACD line/signal crossover."""
-    params = cfg["strategy"]["parameters"]
-    fast   = int(params["fast_ema"])
-    slow   = int(params["slow_ema"])
-    smooth = int(params["signal_smoothing"])
+    fast, slow, smooth = _get_macd_params(cfg)
 
     macd_result = ta.macd(df["close"], fast=fast, slow=slow, signal=smooth)
 
@@ -164,10 +172,7 @@ def get_macd_state(candles: list[dict], cfg: dict) -> dict:
     if len(candles) < 20:
         return {"macd": None, "signal": None, "diff": None, "source_len": len(candles)}
 
-    params = cfg["strategy"]["parameters"]
-    fast   = int(params["fast_ema"])
-    slow   = int(params["slow_ema"])
-    smooth = int(params["signal_smoothing"])
+    fast, slow, smooth = _get_macd_params(cfg)
 
     try:
         df = pd.DataFrame(candles)
