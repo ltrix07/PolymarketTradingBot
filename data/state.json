@@ -1,9 +1,23 @@
 {
   "virtual_portfolio": {
-    "balance_usd": 1000.0,
-    "active_position": null,
+    "balance_usd": 953.1286601853573,
+    "active_position": {
+      "id": "290a668d-a26a-4eb7-ac5c-b7fe44fc62f4",
+      "side": "YES",
+      "entry_price": 0.5251259254458166,
+      "qty": 89.25733341931333,
+      "size_usd": 46.871339814642724,
+      "requested_size_usd": 50.0,
+      "fill_pct": 0.9374,
+      "market_id": "99645751516513068716534071887197538735453711133448175437215891506032678865058",
+      "market_end_date_iso": "2026-03-21T17:20:00+00:00",
+      "sl_pct": 0.025,
+      "tp_pct": 0.05,
+      "trailing_stop_price": null,
+      "timestamp": "2026-03-21T17:12:38.476084+00:00"
+    },
     "daily_pnl": 0.0,
-    "last_update": null,
+    "last_update": "2026-03-21T17:14:44.587900+00:00",
     "trading_halted_until": null
   },
   "trade_history": []

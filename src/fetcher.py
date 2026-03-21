@@ -379,6 +379,172 @@ def fetch_last_trade_price(cfg: dict, token_id: str) -> float | None:
     return asyncio.run(fetch_last_trade_price_async(cfg, token_id))
 
 
+# ── Real-time Binance aggTrade WebSocket feed ─────────────────────────────────
+
+class BinanceTradesFeed:
+    """WebSocket-based real-time Binance aggTrade feed that builds live OHLCV candles.
+
+    Connects to wss://stream.binance.com/ws/btcusdt@aggTrade and assembles
+    candles on-the-fly from individual trade events.  The last candle is always
+    "open" (not yet closed) and updates with every incoming tick.
+
+    Reconnect logic mirrors PolymarketBookFeed.
+    """
+
+    _WS_URL = "wss://stream.binance.com/ws/btcusdt@aggTrade"
+    _RECONNECT_DELAY = 3
+
+    def __init__(self) -> None:
+        self._timeframe_sec: int = 60          # default 1m
+        self._max_history: int = 60            # completed candles to keep
+        self._candles: list[dict] = []          # completed candles
+        self._current_candle: dict | None = None  # open (incomplete) candle
+        self._last_price: float | None = None
+        self._task: asyncio.Task | None = None
+        self._running = False
+        self._tick_event: asyncio.Event = asyncio.Event()
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    async def start(self, cfg: dict) -> None:
+        """Start the background WebSocket listener."""
+        trading = cfg.get("trading", {})
+        self._max_history = int(trading.get("binance_ws_candle_history", 60))
+        # Parse timeframe from strategy config (e.g. "1m" -> 60s)
+        tf_str = cfg.get("strategy", {}).get("timeframe", "1m")
+        self._timeframe_sec = self._parse_timeframe(tf_str)
+        self._running = True
+        self._candles.clear()
+        self._current_candle = None
+        self._last_price = None
+        self._tick_event.clear()
+        self._task = asyncio.create_task(self._listener_loop())
+
+    async def stop(self) -> None:
+        """Cancel the background listener."""
+        self._running = False
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+
+    def is_ready(self) -> bool:
+        """Return True when enough candles are available for strategy."""
+        return len(self._candles) >= 20
+
+    def get_candles(self) -> list[dict]:
+        """Return completed candles + current open candle in Binance REST format.
+
+        The returned list is compatible with fetch_binance_klines_async() output.
+        """
+        result = list(self._candles)
+        if self._current_candle is not None:
+            result.append(dict(self._current_candle))
+        return result
+
+    def get_last_price(self) -> float | None:
+        """Return the last trade price received from the WebSocket."""
+        return self._last_price
+
+    async def wait_for_tick(self, timeout: float | None = None) -> bool:
+        """Wait until a new aggTrade tick arrives. Returns True if tick received."""
+        self._tick_event.clear()
+        try:
+            await asyncio.wait_for(self._tick_event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_timeframe(tf: str) -> int:
+        """Convert timeframe string like '1m', '5m', '1h' to seconds."""
+        tf = tf.strip().lower()
+        if tf.endswith("m"):
+            return int(tf[:-1]) * 60
+        if tf.endswith("h"):
+            return int(tf[:-1]) * 3600
+        return 60  # default 1 minute
+
+    def _process_trade(self, price: float, qty: float, timestamp_ms: int) -> None:
+        """Process a single aggTrade event into the candle builder."""
+        self._last_price = price
+        # Determine which candle interval this trade belongs to
+        candle_start_ms = (timestamp_ms // (self._timeframe_sec * 1000)) * (self._timeframe_sec * 1000)
+
+        if self._current_candle is None or self._current_candle["timestamp"] != candle_start_ms:
+            # Rotate: close the current candle and start a new one
+            if self._current_candle is not None:
+                self._candles.append(self._current_candle)
+                # Trim history
+                if len(self._candles) > self._max_history:
+                    self._candles = self._candles[-self._max_history:]
+
+            self._current_candle = {
+                "timestamp": candle_start_ms,
+                "open": price,
+                "high": price,
+                "low": price,
+                "close": price,
+                "volume": qty,
+            }
+        else:
+            # Update open candle
+            c = self._current_candle
+            c["high"] = max(c["high"], price)
+            c["low"] = min(c["low"], price)
+            c["close"] = price
+            c["volume"] += qty
+
+        self._tick_event.set()
+
+    # ── Background listener ───────────────────────────────────────────────────
+
+    async def _listener_loop(self) -> None:
+        """Connect to Binance aggTrade stream and dispatch events."""
+        import websockets  # deferred — guarded by _WS_AVAILABLE in main.py
+
+        while self._running:
+            try:
+                async with websockets.connect(self._WS_URL) as ws:
+                    _log.info("BinanceTradesFeed connected to %s", self._WS_URL)
+                    while self._running:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                        except asyncio.TimeoutError:
+                            # No trade in 30s is unusual for BTCUSDT but not fatal
+                            continue
+
+                        try:
+                            msg = json.loads(raw)
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+
+                        # aggTrade event structure:
+                        # {"e":"aggTrade","E":ts,"s":"BTCUSDT","p":"price","q":"qty","T":trade_ts,...}
+                        if msg.get("e") != "aggTrade":
+                            continue
+
+                        price = float(msg["p"])
+                        qty = float(msg["q"])
+                        trade_ts = int(msg["T"])
+                        self._process_trade(price, qty, trade_ts)
+
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                _log.warning(
+                    "BinanceTradesFeed disconnected (%s) — reconnecting in %ds",
+                    exc, self._RECONNECT_DELAY,
+                )
+                if self._running:
+                    await asyncio.sleep(self._RECONNECT_DELAY)
+
+
 # ── Real-time WebSocket order book feed ───────────────────────────────────────
 
 class PolymarketBookFeed:

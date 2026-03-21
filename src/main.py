@@ -27,6 +27,7 @@ from fetcher import (
     fetch_polymarket_book_async,
     fetch_last_trade_price_async,
     PolymarketBookFeed,
+    BinanceTradesFeed,
 )
 from strategy import generate_signal, get_macd_state
 from risk import (
@@ -165,7 +166,7 @@ def _print_status(
     if trailing_stop is not None:
         trail_s = f"  trail {_Y}{trailing_stop:.4f}{_RS}"
 
-    print(
+    line = (
         f"  [{cycle:>4}]  {_W}{token_short}…{_RS}"
         f"  ask {_B}{ask:.4f}{_RS}  bid {_B}{bid:.4f}{_RS}"
         f"  spread {spread:.4f}"
@@ -174,6 +175,12 @@ def _print_status(
         f"{macd_s}{imb_s}{trail_s}{trade_s}"
         f"  bal ${balance:.2f}"
     )
+    print(f"\r{line}          ", end="", flush=True)
+
+
+def _print_status_newline() -> None:
+    """Зафиксировать статус-строку перед печатью важного события."""
+    print()
 
 
 # ── Config & utilities ────────────────────────────────────────────────────────
@@ -246,6 +253,17 @@ async def run_loop(cfg: dict) -> None:
     # WS: create feed instance (not started yet — token_id unknown until discovery)
     book_feed: PolymarketBookFeed | None = PolymarketBookFeed() if use_ws else None
 
+    # Binance WS: real-time aggTrade candle builder (opt-in via config)
+    use_binance_ws = cfg.get("trading", {}).get("use_binance_ws", False)
+    if use_binance_ws and not _WS_AVAILABLE:
+        log.warning("websockets not installed — Binance WS feed disabled")
+        use_binance_ws = False
+    binance_feed: BinanceTradesFeed | None = None
+    if use_binance_ws:
+        binance_feed = BinanceTradesFeed()
+        await binance_feed.start(cfg)
+        print(f"  {_C}◉  Binance aggTrade WS{_RS}  candle builder started")
+
     market_info = await _refresh_market_async(cfg, current_token_id=None)
     if market_info is None:
         log.warning("No active market at startup — will retry each cycle.")
@@ -277,6 +295,7 @@ async def run_loop(cfg: dict) -> None:
                     cycle,
                     book_feed=book_feed,
                     use_ws=use_ws,
+                    binance_feed=binance_feed,
                 )
             else:
                 # No position: refresh market discovery when current is stale/expired
@@ -306,8 +325,10 @@ async def run_loop(cfg: dict) -> None:
                         cycle,
                         book_feed=book_feed,
                         use_ws=use_ws,
+                        binance_feed=binance_feed,
                     )
                 else:
+                    _print_status_newline()
                     log.warning("No active market — skipping cycle %d.", cycle)
 
         except _MarketUnavailableError as exc:
@@ -317,6 +338,7 @@ async def run_loop(cfg: dict) -> None:
             if bad_token:
                 _unavailable_tokens.add(bad_token)
             market_info = None
+            _print_status_newline()
             log.warning(
                 "Market unavailable on CLOB — blacklisting token, waiting 30 s for next round."
             )
@@ -324,14 +346,21 @@ async def run_loop(cfg: dict) -> None:
             continue
         except KeyboardInterrupt:
             print(f"\n{_Y}  Bot stopped.{_RS}\n")
-            # WS: stop feed on shutdown
+            # WS: stop feeds on shutdown
             if use_ws and book_feed is not None:
                 await book_feed.stop()
+            if use_binance_ws and binance_feed is not None:
+                await binance_feed.stop()
             break
         except Exception as exc:
+            _print_status_newline()
             log.error("Iteration error: %s", exc)
 
-        await asyncio.sleep(poll_interval)
+        # Tick-driven: wait for next aggTrade tick (poll_interval as fallback/heartbeat)
+        if use_binance_ws and binance_feed is not None:
+            await binance_feed.wait_for_tick(timeout=poll_interval)
+        else:
+            await asyncio.sleep(poll_interval)
 
 
 # ── Single iteration ──────────────────────────────────────────────────────────
@@ -339,6 +368,7 @@ async def run_loop(cfg: dict) -> None:
 async def _iteration(
     cfg: dict, market_id: str, end_date_iso: str, cycle: int,
     book_feed: "PolymarketBookFeed | None" = None, use_ws: bool = False,
+    binance_feed: "BinanceTradesFeed | None" = None,
 ) -> None:
     # ── 1. STATE ──────────────────────────────────────────────────────────────
     state     = load_state(cfg)
@@ -346,6 +376,7 @@ async def _iteration(
     initial = float(cfg.get("risk_management", {}).get("initial_balance_usd", 1000.0))
     current = state["virtual_portfolio"].get("balance_usd", 0.0)
     if current < initial * 0.05:
+        _print_status_newline()
         log.error(
             "\033[1m\033[31mCRITICAL: Слито более 95%% депозита "
             "(остаток $%.2f). Остановка бота.\033[0m",
@@ -370,6 +401,7 @@ async def _iteration(
                         json={"chat_id": chat_id, "text": message},
                     )
             except Exception as tg_exc:
+                _print_status_newline()
                 log.warning("Telegram notification failed: %s", tg_exc)
         sys.exit(0)
 
@@ -407,16 +439,19 @@ async def _iteration(
             result = "WIN" if side == "NO" else "LOSS"
         else:
             if time_since_expiry > 1800:  # 30 минут таймаут
+                _print_status_newline()
                 print(f"  [{cycle:>4}]  {market_id[:12]}…  Oracle timeout (30m). Force closing (Refund).")
                 last_price = pos["entry_price"]  # Закрываем по цене входа (PnL = 0)
                 result = "DRAW"
             else:
+                _print_status_newline()
                 print(f"  [{cycle:>4}]  {market_id[:12]}…  Waiting for Oracle... ({int(time_since_expiry)}s)")
                 save_state(state, cfg)
                 return
 
         state  = close_position(state, last_price, result, cfg, skip_slippage=(result == "DRAW"))
         trade  = state["trade_history"][-1]
+        _print_status_newline()
         _print_close(
             f"EXPIRED {result}",
             pos["entry_price"],
@@ -431,35 +466,54 @@ async def _iteration(
     # market_id here is already the correct market: either position's own market
     # (routed by run_loop) or the currently discovered market (no position).
     ws_extremums = None
+    use_live_candles = False
     try:
+        # Binance candles: prefer live WS feed when ready, fall back to REST
+        if binance_feed is not None and binance_feed.is_ready():
+            candles = binance_feed.get_candles()
+            use_live_candles = True
+            candle_source = "bnb-ws"
+        else:
+            candles = None  # will be fetched below
+            candle_source = "bnb"
+
         # WS: use WebSocket snapshot when available; fall back to HTTP otherwise
         if use_ws and book_feed is not None:
             ws_book = book_feed.get_latest()
             if ws_book is not None:
                 ws_extremums = book_feed.get_and_reset_extremums() if pos is not None else None
-                candles = await fetch_binance_klines_async(cfg)
+                if candles is None:
+                    candles = await fetch_binance_klines_async(cfg)
                 book = ws_book
                 book_source = "ws"
             else:
                 # WebSocket not ready yet — fall back to HTTP
+                if candles is None:
+                    candles, book = await asyncio.gather(
+                        fetch_binance_klines_async(cfg),
+                        fetch_polymarket_book_async(cfg, market_id),
+                    )
+                else:
+                    book = await fetch_polymarket_book_async(cfg, market_id)
+                book_source = "http-fallback"
+        else:
+            if candles is None:
                 candles, book = await asyncio.gather(
                     fetch_binance_klines_async(cfg),
                     fetch_polymarket_book_async(cfg, market_id),
                 )
-                book_source = "http-fallback"
-        else:
-            candles, book = await asyncio.gather(
-                fetch_binance_klines_async(cfg),
-                fetch_polymarket_book_async(cfg, market_id),
-            )
+            else:
+                book = await fetch_polymarket_book_async(cfg, market_id)
             book_source = "http"
     except httpx.HTTPStatusError as exc:
+        _print_status_newline()
         if exc.response.status_code == 404:
             log.warning("CLOB 404 for token %s — market not yet tradeable.", market_id)
             raise _MarketUnavailableError(market_id) from exc
         log.warning("API fetch failed: %s", exc)
         return
     except Exception as exc:
+        _print_status_newline()
         log.warning("API fetch failed: %s", exc)
         return
 
@@ -480,12 +534,13 @@ async def _iteration(
     _print_status(
         market_id[:12], best_ask, best_bid, seconds_left,
         portfolio["balance_usd"], cycle,
-        macd_state=macd_state, source=f"bnb{len(candles)}+{book_source}",
+        macd_state=macd_state, source=f"{candle_source}{len(candles)}+{book_source}",
         can_trade=can_trade, book_imbalance=book_imbalance,
         trailing_stop=trailing,
     )
 
     if portfolio.get("trading_halted_until"):
+        _print_status_newline()
         log.warning("Trading halted until %s", portfolio["trading_halted_until"])
 
     # ── 6. TRAILING STOP UPDATE ───────────────────────────────────────────────
@@ -511,6 +566,7 @@ async def _iteration(
                 exit_p = target_tp_price
                 state  = close_position(state, exit_p, "TP", cfg, book_data=book, skip_slippage=True)
                 trade  = state["trade_history"][-1]
+                _print_status_newline()
                 _print_close(
                     "TP",
                     pos["entry_price"],
@@ -532,6 +588,7 @@ async def _iteration(
                 exit_p = target_sl_price
                 state  = close_position(state, exit_p, "SL", cfg, book_data=book, skip_slippage=True)
                 trade  = state["trade_history"][-1]
+                _print_status_newline()
                 _print_close(
                     "SL",
                     pos["entry_price"],
@@ -555,6 +612,7 @@ async def _iteration(
                 and pos.get("trailing_stop_price") is not None
                 and exit_p <= pos["trailing_stop_price"]
             )
+            _print_status_newline()
             _print_close(
                 trigger,
                 pos["entry_price"],
@@ -571,7 +629,7 @@ async def _iteration(
         save_state(state, cfg)
         return
 
-    signal = generate_signal(candles, cfg, book_data=book)
+    signal = generate_signal(candles, cfg, book_data=book, is_last_candle_open=use_live_candles)
     if signal is None:
         save_state(state, cfg)
         return
@@ -581,6 +639,7 @@ async def _iteration(
     entry_price = best_ask if side == "YES" else (1.0 - best_bid)
 
     if size_usd < 1.0:
+        _print_status_newline()
         log.critical("Balance too low ($%.2f). Stopping.", portfolio["balance_usd"])
         raise SystemExit(1)
 
@@ -590,6 +649,7 @@ async def _iteration(
     if relevant_volume > 0:
         available_usd = relevant_volume * entry_price
         if size_usd > available_usd * 0.5:
+            _print_status_newline()
             log.warning(
                 "Size $%.2f exceeds 50%% of visible %s liquidity ($%.2f). "
                 "Real execution would suffer severe slippage.",
@@ -601,6 +661,7 @@ async def _iteration(
 
     # Time-to-expiry quality check: warn if TP is unlikely within remaining time
     if seconds_left < 120 and tp_pct > 0.10:
+        _print_status_newline()
         log.warning(
             "Only %.0fs to expiry with TP %.1f%% — TP may not be reachable.",
             seconds_left, tp_pct * 100,
@@ -617,6 +678,7 @@ async def _iteration(
     save_state(state, cfg)
 
     new_pos = state["virtual_portfolio"]["active_position"]
+    _print_status_newline()
     _print_open(
         side,
         new_pos["entry_price"],

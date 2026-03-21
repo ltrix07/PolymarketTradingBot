@@ -197,6 +197,7 @@ def generate_signal(
     candles: list[dict],
     cfg: dict,
     book_data: dict | None = None,
+    is_last_candle_open: bool = False,
 ) -> str | None:
     """Generate a trading signal using MACD + RSI + order book confirmation.
 
@@ -204,10 +205,15 @@ def generate_signal(
       - MACD crossover (primary, mandatory)
       - At least one of: RSI not at extreme OR book imbalance confirms direction
 
+    When is_last_candle_open=True (live WebSocket candles), the crossover must
+    have occurred on the completed candles, and the open candle must simply
+    confirm (not reverse) the trend. This prevents false signals from a "twitching" open candle.
+
     Args:
-        candles:   List of OHLCV dicts (Binance 1m candles).
-        cfg:       Bot configuration dict.
-        book_data: Optional dict from fetch_polymarket_book_async (for depth).
+        candles:              List of OHLCV dicts (Binance 1m candles).
+        cfg:                  Bot configuration dict.
+        book_data:            Optional dict from fetch_polymarket_book_async (for depth).
+        is_last_candle_open:  True when the last candle is still forming (live WS feed).
 
     Returns 'BUY_YES', 'BUY_NO', or None.
     """
@@ -218,14 +224,44 @@ def generate_signal(
     df = df[["timestamp", "open", "high", "low", "close", "volume"]].copy()
     df["close"] = pd.to_numeric(df["close"])
 
-    macd_signal = _compute_macd_signal(df, cfg)
-    if macd_signal is None:
-        return None
+    # === ИСПРАВЛЕННЫЙ БЛОК ЛОГИКИ СИГНАЛОВ ===
+    if is_last_candle_open and len(candles) >= 21:
+        # 1. Ищем полноценное пересечение только на закрытых свечах (защита от дергания)
+        df_completed = df.iloc[:-1].copy()
+        macd_signal = _compute_macd_signal(df_completed, cfg)
+        
+        if macd_signal is None:
+            return None
+            
+        # 2. Проверяем, что текущая (открытая) свеча не сломала этот сигнал
+        fast, slow, smooth = _get_macd_params(cfg)
+        macd_result = ta.macd(df["close"], fast=fast, slow=slow, signal=smooth)
+        macd_col = f"MACD_{fast}_{slow}_{smooth}"
+        sig_col = f"MACDs_{fast}_{slow}_{smooth}"
+        
+        curr_macd = macd_result[macd_col].iloc[-1]
+        curr_sig = macd_result[sig_col].iloc[-1]
+        
+        # Если линия MACD провалилась обратно за сигнальную — отменяем вход
+        if macd_signal == "BUY_YES" and curr_macd <= curr_sig:
+            logging.info("Signal BUY_YES reversed on open candle — skipping")
+            return None
+        if macd_signal == "BUY_NO" and curr_macd >= curr_sig:
+            logging.info("Signal BUY_NO reversed on open candle — skipping")
+            return None
+    else:
+        # Стандартная проверка (если фид не использует WS или свеча только что закрылась)
+        macd_signal = _compute_macd_signal(df, cfg)
+        if macd_signal is None:
+            return None
+    # ==========================================
 
     rsi_ok  = _compute_rsi_confirmation(df, cfg, macd_signal)
     book_available = book_data is not None  # BUG FIX: track whether book fetch succeeded
+    
     if not book_available:
         logging.warning("Order book unavailable — falling back to RSI-only confirmation")  # BUG FIX: warn on silent degradation
+        
     book_ok = _compute_book_confirmation(book_data, cfg, macd_signal)
 
     # BUG FIX: when book is available require both confirmations; RSI-only only when book is absent
