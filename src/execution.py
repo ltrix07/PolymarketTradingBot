@@ -59,6 +59,7 @@ def reset_daily_pnl_if_needed(state: dict) -> dict:
     now = datetime.now(timezone.utc)
     if now.date() > last_update.date():
         portfolio["daily_pnl"] = 0.0
+        portfolio["last_sl_timestamp"] = None
         halted_until = portfolio.get("trading_halted_until")
         if halted_until:
             halted_dt = datetime.fromisoformat(halted_until)
@@ -108,7 +109,8 @@ def _simulate_fill_price(
         raw_volume = book_data.get(volume_key, 0.0)
         liquidity = max(raw_volume * base_price, 10.0)
     else:
-        liquidity = 100.0
+        fallback_liquidity = float(sim_cfg.get("liquidity_fallback_usd", 1000.0))
+        liquidity = fallback_liquidity
 
     market_impact   = impact_factor * (filled_size_usd / liquidity)
     total_slippage  = base_slippage + market_impact
@@ -254,6 +256,9 @@ def close_position(
         "pnl":                 round(pnl, 4),
         "result":              result,
     })
+
+    if result == "SL":
+        portfolio["last_sl_timestamp"] = datetime.now(timezone.utc).isoformat()
 
     portfolio["active_position"] = None
     return state

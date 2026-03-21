@@ -91,6 +91,16 @@ def compute_dynamic_sl_tp(
     return sl_pct, tp_pct
 
 
+# ── Exit price helper ─────────────────────────────────────────────────────────
+
+def get_exit_price(position: dict, best_bid: float, best_ask: float) -> float:
+    """Единая точка расчёта текущей цены выхода для YES и NO позиций."""
+    if position["side"] == "YES":
+        return best_bid
+    else:
+        return 1.0 - best_ask
+
+
 # ── Trailing stop ─────────────────────────────────────────────────────────────
 
 def update_trailing_stop(
@@ -138,6 +148,12 @@ def update_trailing_stop(
     else:
         current_price = 1.0 - (ws_extremums["lowest_ask"] if ws_extremums else best_ask)
 
+    # Activate trailing stop only when position is in profit by at least trail_dist
+    if entry_price > 0:
+        profit_pct = (current_price - entry_price) / entry_price
+        if profit_pct < trail_dist:
+            return position
+
     new_stop     = current_price - trail_dist
     current_stop = position.get("trailing_stop_price")
 
@@ -178,13 +194,8 @@ def check_sl_tp(
         return None
 
     risk_cfg   = (cfg or {}).get("risk_management", {})
-    side       = position.get("side", "YES")
 
-    # Determine current exit price
-    if side == "YES":
-        exit_price = best_bid
-    else:
-        exit_price = 1.0 - best_ask
+    exit_price = get_exit_price(position, best_bid, best_ask)
 
     change_pct = (exit_price - entry_price) / entry_price
 
@@ -235,6 +246,16 @@ def should_open_trade(
         return False
     if portfolio.get("balance_usd", 0.0) * position_size_pct <= 0:
         return False
+
+    cooldown_sec = risk_cfg.get("cooldown_after_sl_sec")
+    if cooldown_sec:
+        last_sl = portfolio.get("last_sl_timestamp")
+        if last_sl:
+            last_sl_dt = datetime.fromisoformat(last_sl)
+            if last_sl_dt.tzinfo is None:
+                last_sl_dt = last_sl_dt.replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc) - last_sl_dt).total_seconds() < cooldown_sec:
+                return False
 
     return True
 

@@ -96,8 +96,9 @@ def analyse_bot(cfg: dict) -> dict:
     history = state.get("trade_history", [])
     wins = sum(1 for t in history if t.get("result") == "WIN")
     losses = sum(1 for t in history if t.get("result") == "LOSS")
-    total_closed = wins + losses
-    win_rate = (wins / total_closed * 100) if total_closed else 0.0
+    draws = sum(1 for t in history if t.get("result") == "DRAW")
+    total_decided = wins + losses
+    win_rate = (wins / total_decided * 100) if total_decided else 0.0
 
     active = portfolio.get("active_position")
     if active:
@@ -114,6 +115,7 @@ def analyse_bot(cfg: dict) -> dict:
         "pnl_pct": pnl_pct,
         "wins": wins,
         "losses": losses,
+        "draws": draws,
         "win_rate": win_rate,
         "status": status_str,
         "available": True,
@@ -157,12 +159,14 @@ def build_report(bots: list[dict]) -> str:
         pnl_pct_str = f"{pnl_sign}{bot['pnl_pct']:.2f}%"
         win_icon = "🟢" if bot["wins"] > 0 else ""
         loss_icon = "🔴" if bot["losses"] > 0 else ""
+        draw_icon = "⚪" if bot.get("draws", 0) > 0 else ""
 
+        draw_str = f" | {bot.get('draws', 0)} {draw_icon}" if bot.get("draws", 0) > 0 else ""
         lines += [
             f"🤖 *{i}. {bot['name']}*",
             f"├ 💰 Баланс: ${bot['balance']:.2f} ({pnl_pct_str})",
             f"├ 🎯 Win Rate: {bot['win_rate']:.0f}% "
-            f"({bot['wins']} {win_icon} | {bot['losses']} {loss_icon})",
+            f"({bot['wins']} {win_icon} | {bot['losses']} {loss_icon}{draw_str})",
             f"└ 🔄 Статус: {bot['status']}",
             "",
         ]

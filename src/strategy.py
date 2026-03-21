@@ -115,6 +115,82 @@ def _compute_book_confirmation(book_data: dict | None, cfg: dict, signal: str) -
         return imbalance <= (1.0 - threshold)
 
 
+# ── Entry filters (optional last-layer gate) ──────────────────────────────────
+
+def _apply_entry_filters(
+    cfg: dict,
+    signal: str,
+    book_data: dict | None,
+    candles: list[dict],
+) -> bool:
+    """Return True if the signal passes all configured entry_filters.
+
+    Every filter parameter is optional — absent or None means the filter
+    is skipped, so old configs without entry_filters work unchanged.
+    """
+    filters = cfg.get("strategy", {}).get("entry_filters", {})
+    if not filters:
+        return True
+
+    # ── Price filters (require book_data) ─────────────────────────────────
+    if book_data is not None:
+        # Determine the reference price depending on signal direction
+        if signal == "BUY_YES":
+            ref_price = book_data.get("best_ask")
+        else:
+            ref_price = book_data.get("best_bid")
+
+        if ref_price is not None:
+            uncertainty_band = filters.get("market_uncertainty_band")
+
+            if uncertainty_band is not None:
+                # Symmetric band around 0.5 — has priority over max/min
+                low = 0.5 - float(uncertainty_band)
+                high = 0.5 + float(uncertainty_band)
+                if not (low <= ref_price <= high):
+                    logging.info(
+                        "entry_filter BLOCKED: price %.4f outside uncertainty band [%.2f, %.2f]",
+                        ref_price, low, high,
+                    )
+                    return False
+            else:
+                # Individual max/min price gates
+                max_price = filters.get("max_token_price")
+                if max_price is not None and ref_price > float(max_price):
+                    logging.info(
+                        "entry_filter BLOCKED: price %.4f > max_token_price %.2f",
+                        ref_price, float(max_price),
+                    )
+                    return False
+
+                min_price = filters.get("min_token_price")
+                if min_price is not None and ref_price < float(min_price):
+                    logging.info(
+                        "entry_filter BLOCKED: price %.4f < min_token_price %.2f",
+                        ref_price, float(min_price),
+                    )
+                    return False
+
+    # ── Volume spike filter (uses Binance candle data) ────────────────────
+    require_spike = filters.get("require_volume_spike")
+    if require_spike:
+        period = int(filters.get("volume_spike_period", 10))
+        multiplier = float(filters.get("volume_spike_multiplier", 1.5))
+
+        if len(candles) >= period + 1:
+            volumes = [float(c["volume"]) for c in candles[-(period + 1):]]
+            last_volume = volumes[-1]
+            avg_volume = sum(volumes[:-1]) / period
+            if avg_volume > 0 and last_volume <= multiplier * avg_volume:
+                logging.info(
+                    "entry_filter BLOCKED: volume %.2f <= %.1f * avg %.2f (no spike)",
+                    last_volume, multiplier, avg_volume,
+                )
+                return False
+
+    return True
+
+
 # ── Public API ─────────────────────────────────────────────────────────────────
 
 def generate_signal(
@@ -159,6 +235,10 @@ def generate_signal(
     else:
         if not rsi_ok:
             return None
+
+    # Entry filters — optional last-layer gate
+    if not _apply_entry_filters(cfg, macd_signal, book_data, candles):
+        return None
 
     return macd_signal
 

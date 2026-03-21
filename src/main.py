@@ -38,6 +38,7 @@ from risk import (
     normalize_atr,
     update_trailing_stop,
     compute_dynamic_sl_tp,
+    get_exit_price,
 )
 from execution import (
     load_state,
@@ -504,11 +505,8 @@ async def _iteration(
         use_hard_tp = cfg.get("risk_management", {}).get("use_hard_tp", True)
         if use_hard_tp and ws_extremums is not None:
             target_tp_price = pos["entry_price"] * (1 + pos.get("tp_pct", 0.10))
-            hard_tp_hit = (
-                pos["side"] == "YES" and ws_extremums["highest_bid"] >= target_tp_price
-            ) or (
-                pos["side"] == "NO" and (1.0 - ws_extremums["lowest_ask"]) >= target_tp_price
-            )
+            ws_tp_exit = get_exit_price(pos, ws_extremums["highest_bid"], ws_extremums["lowest_ask"])
+            hard_tp_hit = ws_tp_exit >= target_tp_price
             if hard_tp_hit:
                 exit_p = target_tp_price
                 state  = close_position(state, exit_p, "TP", cfg, book_data=book, skip_slippage=True)
@@ -528,11 +526,8 @@ async def _iteration(
         use_hard_sl = cfg.get("risk_management", {}).get("use_hard_sl", True)
         if use_hard_sl and ws_extremums is not None:
             target_sl_price = pos["entry_price"] * (1 - pos.get("sl_pct", 0.07))
-            hard_sl_hit = (
-                pos["side"] == "YES" and ws_extremums["lowest_bid"] <= target_sl_price
-            ) or (
-                pos["side"] == "NO" and (1.0 - ws_extremums["highest_ask"]) <= target_sl_price
-            )
+            ws_sl_exit = get_exit_price(pos, ws_extremums["lowest_bid"], ws_extremums["highest_ask"])
+            hard_sl_hit = ws_sl_exit <= target_sl_price
             if hard_sl_hit:
                 exit_p = target_sl_price
                 state  = close_position(state, exit_p, "SL", cfg, book_data=book, skip_slippage=True)
@@ -552,7 +547,7 @@ async def _iteration(
         trigger = check_sl_tp(portfolio, best_bid, best_ask, cfg)
         if trigger:
             pos    = portfolio["active_position"]
-            exit_p = best_bid if pos["side"] == "YES" else (1.0 - best_ask)
+            exit_p = get_exit_price(pos, best_bid, best_ask)
             state  = close_position(state, exit_p, trigger, cfg, book_data=book)
             trade  = state["trade_history"][-1]
             is_trailing = (

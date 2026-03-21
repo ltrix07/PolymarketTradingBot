@@ -4,7 +4,8 @@
     "active_position": null,
     "daily_pnl": -95.44119165659421,
     "last_update": "2026-03-19T14:32:25.228862+00:00",
-    "trading_halted_until": "2026-03-20T14:32:24.389523+00:00"
+    "trading_halted_until": "2026-03-20T14:32:24.389523+00:00",
+    "last_sl_timestamp": null
   },
   "trade_history": [
     {
