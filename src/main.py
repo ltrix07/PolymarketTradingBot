@@ -59,9 +59,6 @@ log.setLevel(logging.INFO)
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "config.yaml")
 
-# WS: strategies that activate the WebSocket order book transport
-WS_STRATEGY_NAMES = {"Поздний Снайпер", "Ловец паники"}
-
 # WS: check websockets library availability once at import time
 try:
     import websockets as _websockets_probe  # noqa: F401
@@ -241,8 +238,7 @@ async def run_loop(cfg: dict) -> None:
 
     # WS: determine whether this strategy should use the WebSocket book feed
     global _ws_active_token
-    strategy_name = cfg.get("strategy", {}).get("name", "")
-    use_ws = strategy_name in WS_STRATEGY_NAMES
+    use_ws = cfg.get("trading", {}).get("use_ws", True)
     if use_ws and not _WS_AVAILABLE:
         log.warning("websockets not installed — book feed will use HTTP fallback")
         use_ws = False
@@ -504,7 +500,8 @@ async def _iteration(
         pos = portfolio["active_position"]
 
         # Hard TP: WS extremums may have touched our limit price between poll cycles
-        if ws_extremums is not None:
+        use_hard_tp = cfg.get("risk_management", {}).get("use_hard_tp", True)
+        if use_hard_tp and ws_extremums is not None:
             target_tp_price = pos["entry_price"] * (1 + pos.get("tp_pct", 0.10))
             hard_tp_hit = (
                 pos["side"] == "YES" and ws_extremums["highest_bid"] >= target_tp_price
