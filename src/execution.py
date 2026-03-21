@@ -186,6 +186,7 @@ def close_position(
     result: str,
     cfg: dict,
     book_data: dict | None = None,
+    skip_slippage: bool = False,
 ) -> dict:
     """Close the active paper trading position.
 
@@ -193,6 +194,9 @@ def close_position(
       - result == "WIN"  : market resolved for our side → each token pays $1
       - result == "LOSS" : market resolved against us   → each token pays $0
       - result == "SL" or "TP" : early exit — sell tokens at exit_price with slippage
+
+    skip_slippage=True bypasses _simulate_fill_price() and uses exit_price directly.
+    Use this for Hard TP (Maker limit order — no slippage by definition).
 
     PnL = (qty * resolution_price) - filled_size_usd
     """
@@ -211,10 +215,13 @@ def close_position(
     elif result == "LOSS":
         resolution_price = 0.0
     else:
-        # SL or TP: early exit with sell-side market impact
-        resolution_price = _simulate_fill_price(
-            exit_price, size_usd, book_data, cfg, is_buy=False
-        )
+        # SL or TP: early exit — Hard TP uses exact limit price, others apply slippage
+        if skip_slippage:
+            resolution_price = exit_price
+        else:
+            resolution_price = _simulate_fill_price(
+                exit_price, size_usd, book_data, cfg, is_buy=False
+            )
 
     gross_return = qty * resolution_price
     fee          = gross_return * fee_pct

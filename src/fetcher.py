@@ -411,6 +411,8 @@ class PolymarketBookFeed:
         self._asks: dict[str, float] = {}   # price_str -> size
         self._task: asyncio.Task | None = None
         self._running = False
+        self._highest_bid: float = 0.0
+        self._lowest_ask: float = 1.0
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -422,6 +424,8 @@ class PolymarketBookFeed:
         self._bids.clear()
         self._asks.clear()
         self._state = None
+        self._highest_bid = 0.0
+        self._lowest_ask = 1.0
         self._task = asyncio.create_task(self._listener_loop())
 
     async def stop(self) -> None:
@@ -438,6 +442,20 @@ class PolymarketBookFeed:
     def get_latest(self) -> dict | None:
         """Return a shallow copy of the current _state snapshot, or None."""
         return dict(self._state) if self._state is not None else None
+
+    def get_and_reset_extremums(self) -> dict:
+        """Return highest_bid / lowest_ask accumulated since last call, then reset to current best prices."""
+        result = {
+            "highest_bid": self._highest_bid,
+            "lowest_ask":  self._lowest_ask,
+        }
+        if self._state is not None:
+            self._highest_bid = self._state["best_bid"]
+            self._lowest_ask  = self._state["best_ask"]
+        else:
+            self._highest_bid = 0.0
+            self._lowest_ask  = 1.0
+        return result
 
     # ── Internal state helpers ────────────────────────────────────────────────
 
@@ -484,6 +502,8 @@ class PolymarketBookFeed:
             "top_asks":       top_asks,
             "top_bids":       top_bids,
         }
+        self._highest_bid = max(self._highest_bid, self._state["best_bid"])
+        self._lowest_ask  = min(self._lowest_ask,  self._state["best_ask"])
 
     def _apply_book(self, data: dict) -> None:
         """Rebuild full book from a 'book' event (full snapshot)."""
@@ -527,6 +547,8 @@ class PolymarketBookFeed:
         if "best_bid" in data:
             new_state["best_bid"] = float(data["best_bid"])
         self._state = new_state
+        self._highest_bid = max(self._highest_bid, new_state["best_bid"])
+        self._lowest_ask  = min(self._lowest_ask,  new_state["best_ask"])
 
     # ── Background listener ───────────────────────────────────────────────────
 

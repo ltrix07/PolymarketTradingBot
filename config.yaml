@@ -1,22 +1,15 @@
-# ==========================================
-# POLYMARKET PAPER TRADING BOT CONFIGURATION
-# ==========================================
-
 market:
-  # token_id не используется — бот находит маркет через discovery.
   token_id: ""
   polling_interval_seconds: 10
   network: "polygon-mainnet"
-
 discovery:
   enabled: true
-  query: "Bitcoin Up or Down"      # Основной поисковый запрос
-  coin_slug_prefix: "btc-"         # Только BTC маркеты; "" = любой тикер
+  query: "Bitcoin Up or Down"
+  coin_slug_prefix: "btc-"
   limit: 50
   gamma_api: "https://gamma-api.polymarket.com"
-
 strategy:
-  name: "FastMACD"
+  name: "Агрессивный бот"
   timeframe: "1m"
   parameters:
     fast_ema: 3
@@ -27,51 +20,38 @@ strategy:
       source: "pandas_ta"
     - name: "PriceSource"
       api: "Binance-REST"
-  # RSI confirmation filter: blocks signal when RSI is at extreme
   rsi:
     period: 14
-    overbought: 65           # Don't BUY_YES when RSI >= 65 (already stretched)
-    oversold: 35             # Don't BUY_NO  when RSI <= 35 (already stretched)
-  # Order book depth analysis
+    overbought: 65
+    oversold: 35
   order_book:
-    imbalance_threshold: 0.60  # bid_vol/total_vol > 0.60 = bullish confirmation
-    depth_levels: 5            # How many price levels to sum for volume
-
+    imbalance_threshold: 0.60
+    depth_levels: 5
 risk_management:
   initial_balance_usd: 1000.0
   position_size_pct: 0.05
   stop_loss_pct: 0.07
   take_profit_pct: 0.10
-  max_daily_loss_pct: 0.10
+  max_daily_loss_pct: 0.50
   min_time_before_expiry_sec: 90
   max_time_before_expiry_sec: 360
-  
-  # 1. Главный рубильник: отключаем проверку SL и TP
-  use_sl_tp: false                  
-  
+  use_sl_tp: false
   use_atr_dynamic: true
   atr_period: 14
   atr_sl_multiplier: 5.0
   atr_tp_multiplier: 10.0
-  
-  # 2. Отключаем трейлинг-стоп, чтобы позиция не закрывалась при откатах
-  trailing_stop_enabled: false      
+  trailing_stop_enabled: false
   trailing_stop_atr_multiplier: 3.0
-
 simulation:
-  # execution.py строит полный путь как ../data/<state_file>
-  state_file: "state.json"
-  log_file: "trades.csv"
-  slippage_simulation_pct: 0.001   # Base slippage on entry/exit
+  state_file: "state_aggress.json"
+  log_file: "trades_aggress.csv"
+  slippage_simulation_pct: 0.001
   fee_simulation_pct: 0.000
-  # Realistic market impact: larger orders move price more
-  market_impact_factor: 0.002      # price_impact = factor * (size_usd / liquidity)
-  # Partial fill simulation: not all orders fill 100%
-  partial_fill_min_pct: 0.85       # Fill between 85%-100% of requested size
-
+  market_impact_factor: 0.002
+  partial_fill_min_pct: 0.85
 endpoints:
   polymarket_clob: "https://clob.polymarket.com"
   binance_v3: "https://api.binance.com/api/v3"
-  proxy: "http://skotarenko13802NDV:mrmcIFWs2S@194.35.226.36:50100"   # Раскомментируй для Polymarket (Cloudflare bypass)
-  telegram_bot_token: "8602019058:AAFaJkXq2Uj8OyxC4lJ5dze1gf0fp5KDr6w"   # Вставь токен от @BotFather, например: "7123456789:AAFxxx..."
-  telegram_chat_id: "324521546"     # Твой chat_id (число), например: "123456789"
+  proxy: "http://skotarenko13802NDV:mrmcIFWs2S@194.35.226.36:50100"
+  telegram_bot_token: "8602019058:AAFaJkXq2Uj8OyxC4lJ5dze1gf0fp5KDr6w"
+  telegram_chat_id: "324521546"

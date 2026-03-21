@@ -116,6 +116,7 @@ def _print_open(
 def _print_close(
     trigger: str, entry: float, exit_price: float,
     pnl: float, balance: float, is_trailing: bool = False,
+    label_suffix: str = "",
 ) -> None:
     is_win  = trigger == "TP" or pnl > 0
     colour  = _G if is_win else _R
@@ -126,6 +127,8 @@ def _print_close(
         label = "STOP LOSS (trailing)" if is_trailing else "STOP LOSS"
     else:
         label = "EXPIRED"
+    if label_suffix:
+        label = f"{label} {label_suffix}"
     pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
 
     print(f"\n{_B}{colour}{_bar('═')}{_RS}")
@@ -430,11 +433,13 @@ async def _iteration(
     # ── 2. PARALLEL FETCH ─────────────────────────────────────────────────────
     # market_id here is already the correct market: either position's own market
     # (routed by run_loop) or the currently discovered market (no position).
+    ws_extremums = None
     try:
         # WS: use WebSocket snapshot when available; fall back to HTTP otherwise
         if use_ws and book_feed is not None:
             ws_book = book_feed.get_latest()
             if ws_book is not None:
+                ws_extremums = book_feed.get_and_reset_extremums() if pos is not None else None
                 candles = await fetch_binance_klines_async(cfg)
                 book = ws_book
                 book_source = "ws"
@@ -496,6 +501,32 @@ async def _iteration(
     # ── 7. SL / TP CHECK ──────────────────────────────────────────────────────
     use_sl_tp = cfg.get("risk_management", {}).get("use_sl_tp", True)
     if use_sl_tp and portfolio.get("active_position") is not None:
+        pos = portfolio["active_position"]
+
+        # Hard TP: WS extremums may have touched our limit price between poll cycles
+        if ws_extremums is not None:
+            target_tp_price = pos["entry_price"] * (1 + pos.get("tp_pct", 0.10))
+            hard_tp_hit = (
+                pos["side"] == "YES" and ws_extremums["highest_bid"] >= target_tp_price
+            ) or (
+                pos["side"] == "NO" and (1.0 - ws_extremums["lowest_ask"]) >= target_tp_price
+            )
+            if hard_tp_hit:
+                exit_p = target_tp_price
+                state  = close_position(state, exit_p, "TP", cfg, book_data=book, skip_slippage=True)
+                trade  = state["trade_history"][-1]
+                _print_close(
+                    "TP",
+                    pos["entry_price"],
+                    trade["exit_price"],
+                    trade["pnl"],
+                    state["virtual_portfolio"]["balance_usd"],
+                    label_suffix="(Hard TP)",
+                )
+                save_state(state, cfg)
+                return
+
+        # Soft SL/TP: check against current best prices
         trigger = check_sl_tp(portfolio, best_bid, best_ask, cfg)
         if trigger:
             pos    = portfolio["active_position"]
@@ -544,6 +575,9 @@ async def _iteration(
         state, side, entry_price, size_usd, market_id, cfg,
         book_data=book, sl_pct=sl_pct, tp_pct=tp_pct,
     )
+    # Reset WS extremums NOW so the next iteration tracks spikes only from this moment
+    if use_ws and book_feed is not None:
+        book_feed.get_and_reset_extremums()
     save_state(state, cfg)
 
     new_pos = state["virtual_portfolio"]["active_position"]
