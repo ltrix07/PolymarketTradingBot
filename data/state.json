@@ -1,76 +1,10 @@
 {
   "virtual_portfolio": {
-    "balance_usd": 904.5588083434058,
+    "balance_usd": 1000.0,
     "active_position": null,
-    "daily_pnl": -95.44119165659421,
-    "last_update": "2026-03-19T14:32:25.228862+00:00",
-    "trading_halted_until": "2026-03-20T14:32:24.389523+00:00",
-    "last_sl_timestamp": null
+    "daily_pnl": 0.0,
+    "last_update": null,
+    "trading_halted_until": null
   },
-  "trade_history": [
-    {
-      "id": "c182f2d8-ee5d-4f46-ae4d-fb947d3b03fc",
-      "timestamp": "2026-03-19T13:41:38.387729+00:00",
-      "market_id": "9486299802682902863414396996740381536811617614809897072954735763978047490972",
-      "side": "YES",
-      "entry_price": 0.5105285357327772,
-      "qty": 86.6409,
-      "exit_price": 1.0,
-      "size_usd": 44.23265323447461,
-      "fill_pct": 0.8847,
-      "sl_pct": 0.0553,
-      "tp_pct": 0.1107,
-      "trailing_stop_price": null,
-      "pnl": 42.4082,
-      "result": "WIN"
-    },
-    {
-      "id": "1fbec0c9-ec4d-40c4-b57a-edc822466d44",
-      "timestamp": "2026-03-19T13:58:12.278835+00:00",
-      "market_id": "95967082559609960430386205865304685188296305864308076708153371450535892939560",
-      "side": "YES",
-      "entry_price": 0.5105473599190172,
-      "qty": 89.6515,
-      "exit_price": 0.0,
-      "size_usd": 45.77131798441326,
-      "fill_pct": 0.8782,
-      "sl_pct": 0.0862,
-      "tp_pct": 0.1723,
-      "trailing_stop_price": null,
-      "pnl": -45.7713,
-      "result": "LOSS"
-    },
-    {
-      "id": "98a8dcc6-e8b2-4b3e-89b6-73060df9007d",
-      "timestamp": "2026-03-19T14:09:06.557952+00:00",
-      "market_id": "10787832043260907491824034081793431046277132275845462554774071191612430029562",
-      "side": "YES",
-      "entry_price": 0.5005266414178842,
-      "qty": 91.0077,
-      "exit_price": 0.0,
-      "size_usd": 45.5517627124778,
-      "fill_pct": 0.9141,
-      "sl_pct": 0.0736,
-      "tp_pct": 0.1471,
-      "trailing_stop_price": null,
-      "pnl": -45.5518,
-      "result": "LOSS"
-    },
-    {
-      "id": "f94175d4-ab45-4fca-a22a-ebeb507d7225",
-      "timestamp": "2026-03-19T14:28:46.748466+00:00",
-      "market_id": "10975318267420759090969594369102895220170585179366870155806765113031355989655",
-      "side": "YES",
-      "entry_price": 0.5105743491425146,
-      "qty": 91.1255,
-      "exit_price": 0.0,
-      "size_usd": 46.52636051234921,
-      "fill_pct": 0.9784,
-      "sl_pct": 0.063,
-      "tp_pct": 0.1261,
-      "trailing_stop_price": null,
-      "pnl": -46.5264,
-      "result": "LOSS"
-    }
-  ]
+  "trade_history": []
 }
