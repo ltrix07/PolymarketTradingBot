@@ -99,16 +99,19 @@ def update_trailing_stop(
     best_ask: float,
     atr_normalized: float | None,
     cfg: dict,
+    ws_extremums: dict | None = None,
 ) -> dict:
     """Move trailing stop price upward as the position gains value.
 
-    For YES positions: current price = best_bid (what you'd receive on exit).
-      trailing_stop = best_bid - trail_dist
-      Only moves UP — never pulled back down.
+    When ws_extremums is provided, uses the peak prices observed between polls
+    (highest_bid for YES, lowest_ask for NO) so the trailing stop ratchets to
+    the true watermark, not just the price at poll time.
 
-    For NO positions: current price = 1.0 - best_ask (NO token exit price).
-      trailing_stop = (1 - best_ask) - trail_dist
-      Only moves UP — never pulled back down.
+    For YES positions: peak price = highest_bid (best exit price seen).
+      trailing_stop = peak - trail_dist.  Only moves UP.
+
+    For NO positions: peak price = 1.0 - lowest_ask (best NO exit seen).
+      trailing_stop = peak - trail_dist.  Only moves UP.
 
     Trail distance = trailing_stop_atr_multiplier * atr_normalized,
     with a fallback of 3% of entry price when ATR is unavailable.
@@ -131,9 +134,9 @@ def update_trailing_stop(
     trail_dist = max(0.01, min(trail_dist, 0.20))
 
     if side == "YES":
-        current_price = best_bid
+        current_price = ws_extremums["highest_bid"] if ws_extremums else best_bid
     else:
-        current_price = 1.0 - best_ask  # NO token price moves inversely to YES
+        current_price = 1.0 - (ws_extremums["lowest_ask"] if ws_extremums else best_ask)
 
     new_stop     = current_price - trail_dist
     current_stop = position.get("trailing_stop_price")

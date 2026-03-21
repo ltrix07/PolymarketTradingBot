@@ -412,7 +412,9 @@ class PolymarketBookFeed:
         self._task: asyncio.Task | None = None
         self._running = False
         self._highest_bid: float = 0.0
+        self._lowest_bid: float = 1.0
         self._lowest_ask: float = 1.0
+        self._highest_ask: float = 0.0
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -425,7 +427,9 @@ class PolymarketBookFeed:
         self._asks.clear()
         self._state = None
         self._highest_bid = 0.0
+        self._lowest_bid = 1.0
         self._lowest_ask = 1.0
+        self._highest_ask = 0.0
         self._task = asyncio.create_task(self._listener_loop())
 
     async def stop(self) -> None:
@@ -444,17 +448,30 @@ class PolymarketBookFeed:
         return dict(self._state) if self._state is not None else None
 
     def get_and_reset_extremums(self) -> dict:
-        """Return highest_bid / lowest_ask accumulated since last call, then reset to current best prices."""
+        """Return bid/ask extremums accumulated since last call, then reset to current best prices.
+
+        Returns:
+            highest_bid — for Hard TP on YES (price rose to our limit)
+            lowest_bid  — for Hard SL on YES (price dropped to our stop)
+            lowest_ask  — for Hard TP on NO  (1 - lowest_ask = max NO price)
+            highest_ask — for Hard SL on NO  (1 - highest_ask = min NO price)
+        """
         result = {
             "highest_bid": self._highest_bid,
+            "lowest_bid":  self._lowest_bid,
             "lowest_ask":  self._lowest_ask,
+            "highest_ask": self._highest_ask,
         }
         if self._state is not None:
             self._highest_bid = self._state["best_bid"]
+            self._lowest_bid  = self._state["best_bid"]
             self._lowest_ask  = self._state["best_ask"]
+            self._highest_ask = self._state["best_ask"]
         else:
             self._highest_bid = 0.0
+            self._lowest_bid  = 1.0
             self._lowest_ask  = 1.0
+            self._highest_ask = 0.0
         return result
 
     # ── Internal state helpers ────────────────────────────────────────────────
@@ -503,7 +520,9 @@ class PolymarketBookFeed:
             "top_bids":       top_bids,
         }
         self._highest_bid = max(self._highest_bid, self._state["best_bid"])
+        self._lowest_bid  = min(self._lowest_bid,  self._state["best_bid"])
         self._lowest_ask  = min(self._lowest_ask,  self._state["best_ask"])
+        self._highest_ask = max(self._highest_ask, self._state["best_ask"])
 
     def _apply_book(self, data: dict) -> None:
         """Rebuild full book from a 'book' event (full snapshot)."""
@@ -524,13 +543,13 @@ class PolymarketBookFeed:
         for change in data.get("changes", []):
             price = str(change.get("price", "0"))
             size  = float(change.get("size", 0))
-            side  = change.get("side", "").lower()
-            if side == "ask":
+            side  = change.get("side", "").upper()
+            if side in ("ASK", "SELL"):
                 if size == 0:
                     self._asks.pop(price, None)
                 else:
                     self._asks[price] = size
-            elif side == "bid":
+            elif side in ("BID", "BUY"):
                 if size == 0:
                     self._bids.pop(price, None)
                 else:
@@ -548,7 +567,9 @@ class PolymarketBookFeed:
             new_state["best_bid"] = float(data["best_bid"])
         self._state = new_state
         self._highest_bid = max(self._highest_bid, new_state["best_bid"])
+        self._lowest_bid  = min(self._lowest_bid,  new_state["best_bid"])
         self._lowest_ask  = min(self._lowest_ask,  new_state["best_ask"])
+        self._highest_ask = max(self._highest_ask, new_state["best_ask"])
 
     # ── Background listener ───────────────────────────────────────────────────
 
@@ -591,13 +612,18 @@ class PolymarketBookFeed:
                         except (json.JSONDecodeError, TypeError):
                             continue
 
-                        event_type = msg.get("event_type") or msg.get("type", "")
-                        if event_type == "book":
-                            self._apply_book(msg)
-                        elif event_type == "price_change":
-                            self._apply_price_change(msg)
-                        elif event_type == "best_bid_ask":
-                            self._apply_best_bid_ask(msg)
+                        # Polymarket CLOB can send a list of events in one frame
+                        events = msg if isinstance(msg, list) else [msg]
+                        for event in events:
+                            if not isinstance(event, dict):
+                                continue
+                            event_type = event.get("event_type") or event.get("type", "")
+                            if event_type == "book":
+                                self._apply_book(event)
+                            elif event_type == "price_change":
+                                self._apply_price_change(event)
+                            elif event_type == "best_bid_ask":
+                                self._apply_best_bid_ask(event)
 
             except asyncio.CancelledError:
                 return

@@ -414,7 +414,7 @@ async def _iteration(
                 save_state(state, cfg)
                 return
 
-        state  = close_position(state, last_price, result, cfg)
+        state  = close_position(state, last_price, result, cfg, skip_slippage=(result == "DRAW"))
         trade  = state["trade_history"][-1]
         _print_close(
             f"EXPIRED {result}",
@@ -490,7 +490,8 @@ async def _iteration(
     # ── 6. TRAILING STOP UPDATE ───────────────────────────────────────────────
     if pos is not None:
         portfolio["active_position"] = update_trailing_stop(
-            pos, best_bid, best_ask, atr_normalized, cfg
+            pos, best_bid, best_ask, atr_normalized, cfg,
+            ws_extremums=ws_extremums,
         )
         state["virtual_portfolio"] = portfolio
 
@@ -519,6 +520,30 @@ async def _iteration(
                     trade["pnl"],
                     state["virtual_portfolio"]["balance_usd"],
                     label_suffix="(Hard TP)",
+                )
+                save_state(state, cfg)
+                return
+
+        # Hard SL: WS extremums may have touched our stop-loss price between poll cycles
+        use_hard_sl = cfg.get("risk_management", {}).get("use_hard_sl", True)
+        if use_hard_sl and ws_extremums is not None:
+            target_sl_price = pos["entry_price"] * (1 - pos.get("sl_pct", 0.07))
+            hard_sl_hit = (
+                pos["side"] == "YES" and ws_extremums["lowest_bid"] <= target_sl_price
+            ) or (
+                pos["side"] == "NO" and (1.0 - ws_extremums["highest_ask"]) <= target_sl_price
+            )
+            if hard_sl_hit:
+                exit_p = target_sl_price
+                state  = close_position(state, exit_p, "SL", cfg, book_data=book, skip_slippage=True)
+                trade  = state["trade_history"][-1]
+                _print_close(
+                    "SL",
+                    pos["entry_price"],
+                    trade["exit_price"],
+                    trade["pnl"],
+                    state["virtual_portfolio"]["balance_usd"],
+                    label_suffix="(Hard SL)",
                 )
                 save_state(state, cfg)
                 return
@@ -564,8 +589,27 @@ async def _iteration(
         log.critical("Balance too low ($%.2f). Stopping.", portfolio["balance_usd"])
         raise SystemExit(1)
 
+    # Depth warning: alert if order size exceeds visible book liquidity
+    relevant_vol_key = "ask_volume" if side == "YES" else "bid_volume"
+    relevant_volume = book.get(relevant_vol_key, 0)
+    if relevant_volume > 0:
+        available_usd = relevant_volume * entry_price
+        if size_usd > available_usd * 0.5:
+            log.warning(
+                "Size $%.2f exceeds 50%% of visible %s liquidity ($%.2f). "
+                "Real execution would suffer severe slippage.",
+                size_usd, relevant_vol_key, available_usd,
+            )
+
     # Compute dynamic SL/TP from current ATR before opening
     sl_pct, tp_pct = compute_dynamic_sl_tp(atr_normalized, cfg)
+
+    # Time-to-expiry quality check: warn if TP is unlikely within remaining time
+    if seconds_left < 120 and tp_pct > 0.10:
+        log.warning(
+            "Only %.0fs to expiry with TP %.1f%% — TP may not be reachable.",
+            seconds_left, tp_pct * 100,
+        )
 
     cfg["_current_market_end_date_iso"] = end_date_iso
     state = open_position(

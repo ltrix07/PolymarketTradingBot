@@ -95,10 +95,17 @@ def _simulate_fill_price(
     impact_factor = float(sim_cfg.get("market_impact_factor", 0.002))
 
     if book_data is not None:
-        # For buying YES: consume ask liquidity; for selling: consume bid liquidity
+        # Spread-based slippage: half the current spread is a more realistic
+        # baseline than the fixed 0.1% default. Polymarket spreads are 0.02–0.08.
+        spread = book_data.get("best_ask", base_price) - book_data.get("best_bid", base_price)
+        if base_price > 0:
+            spread_slippage_pct = max(spread / 2.0, 0.0) / base_price
+        else:
+            spread_slippage_pct = 0.0
+        base_slippage = max(base_slippage, spread_slippage_pct)
+
         volume_key = "ask_volume" if is_buy else "bid_volume"
         raw_volume = book_data.get(volume_key, 0.0)
-        # Convert token volume → USD using base_price; floor at $10
         liquidity = max(raw_volume * base_price, 10.0)
     else:
         liquidity = 100.0
