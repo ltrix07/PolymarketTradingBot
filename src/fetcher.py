@@ -235,10 +235,14 @@ async def find_active_market_id_async(cfg: dict, skip_token_ids: set | None = No
 
 
 async def fetch_binance_klines_async(cfg: dict) -> list:
-    """Fetch the last 50 1-minute OHLCV candles for BTCUSDT from Binance (async)."""
+    """Fetch the latest OHLCV candles for BTCUSDT from Binance (async)."""
     base_url = cfg["endpoints"]["binance_v3"]
     url = f"{base_url}/klines"
-    params = {"symbol": "BTCUSDT", "interval": "1m", "limit": 50}
+    
+    tf = cfg.get("strategy", {}).get("timeframe", "1m")
+    limit = int(cfg.get("trading", {}).get("binance_ws_candle_history", 300))
+    
+    params = {"symbol": "BTCUSDT", "interval": tf, "limit": limit}
 
     async with httpx.AsyncClient(timeout=5.0) as client:
         response = await client.get(url, params=params)
@@ -407,7 +411,11 @@ class BinanceTradesFeed:
     # ── Public API ────────────────────────────────────────────────────────────
 
     async def start(self, cfg: dict) -> None:
-        """Start the background WebSocket listener."""
+        """Start the background WebSocket listener.
+
+        Bootstraps historical candles from Binance REST so the MACD can
+        compute meaningful values from the very first iteration (no cold-start).
+        """
         trading = cfg.get("trading", {})
         self._max_history = int(trading.get("binance_ws_candle_history", 60))
         # Parse timeframe from strategy config (e.g. "1m" -> 60s)
@@ -418,7 +426,29 @@ class BinanceTradesFeed:
         self._current_candle = None
         self._last_price = None
         self._tick_event.clear()
+
+        await self._bootstrap_from_rest(cfg)
+
         self._task = asyncio.create_task(self._listener_loop())
+
+    async def _bootstrap_from_rest(self, cfg: dict) -> None:
+        """Pre-load historical candles from Binance REST to avoid cold-start."""
+        try:
+            rest_candles = await fetch_binance_klines_async(cfg)
+            if not rest_candles:
+                return
+            # All except last are completed; last may still be open
+            self._candles = rest_candles[:-1]
+            self._current_candle = rest_candles[-1]
+            self._last_price = float(rest_candles[-1]["close"])
+            if len(self._candles) > self._max_history:
+                self._candles = self._candles[-self._max_history:]
+            _log.info(
+                "BinanceTradesFeed bootstrapped with %d REST candles",
+                len(self._candles),
+            )
+        except Exception as exc:
+            _log.warning("BinanceTradesFeed REST bootstrap failed: %s", exc)
 
     async def stop(self) -> None:
         """Cancel the background listener."""
@@ -462,8 +492,10 @@ class BinanceTradesFeed:
 
     @staticmethod
     def _parse_timeframe(tf: str) -> int:
-        """Convert timeframe string like '1m', '5m', '1h' to seconds."""
+        """Convert timeframe string like '1s', '1m', '5m', '1h' to seconds."""
         tf = tf.strip().lower()
+        if tf.endswith("s"):
+            return max(1, int(tf[:-1]))
         if tf.endswith("m"):
             return int(tf[:-1]) * 60
         if tf.endswith("h"):

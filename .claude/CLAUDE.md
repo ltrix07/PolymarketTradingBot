@@ -75,15 +75,26 @@ strategy:
     min_token_price: 0.30         # не входить если YES ask ниже порога
     market_uncertainty_band: 0.15 # входить только если цена в диапазоне [0.5-band, 0.5+band]
                                   # например 0.15 → только при цене 0.35–0.65
+    trend_ema_period: 50          # торговать только по тренду: close > EMA → YES, close < EMA → NO
     require_volume_spike: true    # требовать всплеск объёма BTC на Binance
     volume_spike_multiplier: 1.5  # объём последней свечи > multiplier * среднее
     volume_spike_period: 10       # период для расчёта среднего объёма (свечей)
 ```
 
+### Market open price filter (автоматический, без конфига)
+
+5-минутные маркеты Polymarket резолвятся по условию: YES выигрывает если BTC при экспирации > BTC при открытии маркета. Фильтр вычисляет цену BTC в момент открытия маркета (`end_date_iso - 300s`) из свечей Binance и блокирует сигналы, противоречащие текущему состоянию:
+- BUY_YES блокируется если текущая цена BTC < цена при открытии маркета (NO выигрывает)
+- BUY_NO блокируется если текущая цена BTC > цена при открытии маркета (YES выигрывает)
+
+Вычисление — в `main.py::_get_market_open_btc_price()`, фильтр — в `strategy.py::_apply_entry_filters()`.
+
 ### Правила реализации
 - Фильтры применяются в `generate_signal()` после MACD + RSI + book — последним слоем
 - Каждый параметр читается через `.get()` с дефолтом `None` — если `None` фильтр пропускается
+- `trend_ema_period` — вычисляет EMA(N) по close. Если close > EMA → аптренд → только BUY_YES. Если close < EMA → даунтренд → только BUY_NO
 - `max_token_price` / `min_token_price` используют `book_data["best_ask"]` для YES, `book_data["best_bid"]` для NO
 - `market_uncertainty_band` — симметричен вокруг 0.5, имеет приоритет над `max/min_token_price` если оба заданы
 - `volume_spike` считается по полю `volume` из candles которые уже передаются в функцию
+- Market open price filter — всегда активен, не требует конфига, `market_open_price` передаётся из `main.py`
 - При отсутствии `book_data` ценовые фильтры пропускаются (не блокируют сигнал)

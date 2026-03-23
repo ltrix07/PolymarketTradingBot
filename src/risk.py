@@ -85,8 +85,8 @@ def compute_dynamic_sl_tp(
     sl_mult = float(risk_cfg.get("atr_sl_multiplier", 5.0))
     tp_mult = float(risk_cfg.get("atr_tp_multiplier", 10.0))
 
-    sl_pct = max(0.02, min(atr_normalized * sl_mult, 0.20))
-    tp_pct = max(0.04, min(atr_normalized * tp_mult, 0.50))
+    sl_pct = max(0.06, min(atr_normalized * sl_mult, 0.20))
+    tp_pct = max(0.08, min(atr_normalized * tp_mult, 0.50))
 
     return sl_pct, tp_pct
 

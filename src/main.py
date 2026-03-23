@@ -98,6 +98,8 @@ def _print_open(
     side: str, entry: float, size: float, balance: float,
     expires_in: float, market_slug: str,
     fill_pct: float, sl_pct: float, tp_pct: float,
+    market_open_price: float | None = None,
+    current_btc: float | None = None,
 ) -> None:
     side_label = f"{_G}▲  LONG  YES{_RS}" if side == "YES" else f"{_R}▼  SHORT  NO{_RS}"
     fill_str   = f"  {_Y}fill {fill_pct*100:.0f}%{_RS}" if fill_pct < 0.999 else ""
@@ -106,6 +108,13 @@ def _print_open(
     print(f"{_C}{_bar()}{_RS}")
     print(f"  Market  {_W}{market_slug}{_RS}")
     print(f"  Entry   {_B}{entry:.4f}{_RS}   Size  {_B}${size:.2f}{_RS}")
+    if market_open_price is not None and current_btc is not None:
+        delta = current_btc - market_open_price
+        delta_col = _G if delta > 0 else _R
+        print(
+            f"  BTC     {_B}${current_btc:,.2f}{_RS}  vs open  "
+            f"{_B}${market_open_price:,.2f}{_RS}  ({delta_col}{delta:+.2f}{_RS})"
+        )
     print(f"  SL      {_R}{sl_pct*100:.1f}%{_RS}   TP  {_G}{tp_pct*100:.1f}%{_RS}  (dynamic)")
     print(f"  Balance {_B}${balance:.2f}{_RS}  after deduction")
     print(f"  Expires in {_B}{expires_in:.0f}s{_RS}")
@@ -200,6 +209,37 @@ def _seconds_until_expiry(end_date_iso: str) -> float:
     if end_dt.tzinfo is None:
         end_dt = end_dt.replace(tzinfo=timezone.utc)
     return max(0.0, (end_dt - datetime.now(timezone.utc)).total_seconds())
+
+
+def _get_market_open_btc_price(end_date_iso: str, candles: list[dict]) -> float | None:
+    """Calculate BTC price at the moment a 5-minute Polymarket market opened.
+
+    The market open time = end_date_iso - 300 seconds.  We find the 1-minute
+    Binance candle that covers that moment and return its close price (best
+    approximation of BTC price at market open).
+
+    Returns None when data is insufficient.
+    """
+    if not end_date_iso or not candles:
+        return None
+    try:
+        end_dt = datetime.fromisoformat(end_date_iso.replace("Z", "+00:00"))
+        if end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+    market_open_ts_ms = int((end_dt.timestamp() - 300) * 1000)
+
+    # Find the most recent candle whose open timestamp <= market_open_ts_ms
+    best = None
+    for c in candles:
+        if c["timestamp"] <= market_open_ts_ms:
+            best = c
+        else:
+            break
+
+    return float(best["close"]) if best is not None else None
 
 
 async def _refresh_market_async(
@@ -578,12 +618,67 @@ async def _iteration(
                 save_state(state, cfg)
                 return
 
+        # ── SL detection with confirmation delay ─────────────────────────
+        sl_confirm_sec = float(cfg.get("risk_management", {}).get("sl_confirm_seconds", 0))
+
         # Hard SL: WS extremums may have touched our stop-loss price between poll cycles
+        hard_sl_hit = False
+        target_sl_price = None
         use_hard_sl = cfg.get("risk_management", {}).get("use_hard_sl", True)
         if use_hard_sl and ws_extremums is not None:
             target_sl_price = pos["entry_price"] * (1 - pos.get("sl_pct", 0.07))
             ws_sl_exit = get_exit_price(pos, ws_extremums["lowest_bid"], ws_extremums["highest_ask"])
             hard_sl_hit = ws_sl_exit <= target_sl_price
+
+        # Soft SL/TP: check against current best prices
+        trigger = check_sl_tp(portfolio, best_bid, best_ask, cfg)
+
+        # Soft TP fires immediately — no confirmation delay
+        if trigger == "TP":
+            pos    = portfolio["active_position"]
+            exit_p = get_exit_price(pos, best_bid, best_ask)
+            state  = close_position(state, exit_p, "TP", cfg, book_data=book)
+            trade  = state["trade_history"][-1]
+            _print_status_newline()
+            _print_close(
+                "TP",
+                pos["entry_price"],
+                trade["exit_price"],
+                trade["pnl"],
+                state["virtual_portfolio"]["balance_usd"],
+            )
+            save_state(state, cfg)
+            return
+
+        # SL breach detected? (Hard or Soft)
+        soft_sl_hit = (trigger == "SL")
+        sl_hit = hard_sl_hit or soft_sl_hit
+
+        # Apply confirmation delay: wait sl_confirm_seconds before executing SL
+        if sl_hit and sl_confirm_sec > 0:
+            now = datetime.now(timezone.utc)
+            breach_since = pos.get("sl_breach_since")
+            if not breach_since:
+                pos["sl_breach_since"] = now.isoformat()
+                state["virtual_portfolio"]["active_position"] = pos
+                _print_status_newline()
+                log.info(
+                    "SL breach detected — confirming for %ds...",
+                    int(sl_confirm_sec),
+                )
+                save_state(state, cfg)
+                return
+            breach_dt = datetime.fromisoformat(breach_since)
+            if breach_dt.tzinfo is None:
+                breach_dt = breach_dt.replace(tzinfo=timezone.utc)
+            elapsed = (now - breach_dt).total_seconds()
+            if elapsed < sl_confirm_sec:
+                log.info("SL confirming... %.0fs / %ds", elapsed, int(sl_confirm_sec))
+                save_state(state, cfg)
+                return
+            log.info("SL breach confirmed after %.0fs", elapsed)
+
+        if sl_hit:
             if hard_sl_hit:
                 exit_p = target_sl_price
                 state  = close_position(state, exit_p, "SL", cfg, book_data=book, skip_slippage=True)
@@ -597,39 +692,46 @@ async def _iteration(
                     state["virtual_portfolio"]["balance_usd"],
                     label_suffix="(Hard SL)",
                 )
-                save_state(state, cfg)
-                return
-
-        # Soft SL/TP: check against current best prices
-        trigger = check_sl_tp(portfolio, best_bid, best_ask, cfg)
-        if trigger:
-            pos    = portfolio["active_position"]
-            exit_p = get_exit_price(pos, best_bid, best_ask)
-            state  = close_position(state, exit_p, trigger, cfg, book_data=book)
-            trade  = state["trade_history"][-1]
-            is_trailing = (
-                trigger == "SL"
-                and pos.get("trailing_stop_price") is not None
-                and exit_p <= pos["trailing_stop_price"]
-            )
-            _print_status_newline()
-            _print_close(
-                trigger,
-                pos["entry_price"],
-                trade["exit_price"],
-                trade["pnl"],
-                state["virtual_portfolio"]["balance_usd"],
-                is_trailing=is_trailing,
-            )
+            else:
+                pos    = portfolio["active_position"]
+                exit_p = get_exit_price(pos, best_bid, best_ask)
+                state  = close_position(state, exit_p, "SL", cfg, book_data=book)
+                trade  = state["trade_history"][-1]
+                is_trailing = (
+                    pos.get("trailing_stop_price") is not None
+                    and exit_p <= pos["trailing_stop_price"]
+                )
+                _print_status_newline()
+                _print_close(
+                    "SL",
+                    pos["entry_price"],
+                    trade["exit_price"],
+                    trade["pnl"],
+                    state["virtual_portfolio"]["balance_usd"],
+                    is_trailing=is_trailing,
+                )
             save_state(state, cfg)
             return
+
+        # No SL breach — clear confirmation timer if it was set
+        if pos.get("sl_breach_since"):
+            log.info("SL breach cleared — price recovered")
+            pos.pop("sl_breach_since", None)
+            state["virtual_portfolio"]["active_position"] = pos
 
     # ── 8. OPEN TRADE ─────────────────────────────────────────────────────────
     if not should_open_trade(portfolio, seconds_left, cfg):
         save_state(state, cfg)
         return
 
-    signal = generate_signal(candles, cfg, book_data=book, is_last_candle_open=use_live_candles)
+    # Calculate BTC price at market open — key reference for 5-min market prediction
+    market_open_price = _get_market_open_btc_price(end_date_iso, candles)
+
+    signal = generate_signal(
+        candles, cfg, book_data=book,
+        is_last_candle_open=use_live_candles,
+        market_open_price=market_open_price,
+    )
     if signal is None:
         save_state(state, cfg)
         return
@@ -658,6 +760,19 @@ async def _iteration(
 
     # Compute dynamic SL/TP from current ATR before opening
     sl_pct, tp_pct = compute_dynamic_sl_tp(atr_normalized, cfg)
+
+    # Spread viability check: don't open if spread eats too much of the SL room
+    spread = best_ask - best_bid
+    if entry_price > 0 and spread > 0:
+        spread_cost_pct = spread / entry_price
+        if spread_cost_pct >= sl_pct * 0.75:
+            _print_status_newline()
+            log.info(
+                "Spread too wide for SL: spread %.1f%% >= 75%% of SL %.1f%% — skipping",
+                spread_cost_pct * 100, sl_pct * 100,
+            )
+            save_state(state, cfg)
+            return
 
     # Time-to-expiry quality check: warn if TP is unlikely within remaining time
     if seconds_left < 120 and tp_pct > 0.10:
@@ -689,6 +804,8 @@ async def _iteration(
         new_pos.get("fill_pct", 1.0),
         new_pos.get("sl_pct", sl_pct),
         new_pos.get("tp_pct", tp_pct),
+        market_open_price=market_open_price,
+        current_btc=float(candles[-1]["close"]) if candles else None,
     )
 
 

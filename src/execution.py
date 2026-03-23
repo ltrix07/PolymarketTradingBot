@@ -16,6 +16,7 @@ New in this version:
 No real orders are sent anywhere.
 """
 
+import csv
 import json
 import os
 import random
@@ -260,5 +261,29 @@ def close_position(
     if result == "SL":
         portfolio["last_sl_timestamp"] = datetime.now(timezone.utc).isoformat()
 
+    # Append trade to CSV log
+    _append_trade_csv(state["trade_history"][-1], cfg)
+
     portfolio["active_position"] = None
     return state
+
+
+def _append_trade_csv(trade: dict, cfg: dict) -> None:
+    """Append a completed trade row to the CSV log file."""
+    log_file = cfg.get("simulation", {}).get("log_file")
+    if not log_file:
+        return
+    csv_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "data", log_file)
+    )
+    fields = [
+        "timestamp", "side", "result", "entry_price", "exit_price",
+        "size_usd", "qty", "fill_pct", "sl_pct", "tp_pct",
+        "pnl", "trailing_stop_price",
+    ]
+    file_exists = os.path.isfile(csv_path)
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(trade)
