@@ -33,8 +33,28 @@ def _state_path(cfg: dict) -> str:
     )
 
 
+def _default_state(cfg: dict) -> dict:
+    balance = float(cfg.get("risk_management", {}).get("initial_balance_usd", 1000.0))
+    return {
+        "virtual_portfolio": {
+            "balance_usd": balance,
+            "active_position": None,
+            "daily_pnl": 0.0,
+            "last_update": None,
+            "trading_halted_until": None,
+        },
+        "trade_history": [],
+    }
+
+
 def load_state(cfg: dict) -> dict:
     path = _state_path(cfg)
+    if not os.path.isfile(path):
+        state = _default_state(cfg)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+        return state
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
