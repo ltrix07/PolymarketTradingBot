@@ -14,6 +14,7 @@ Key improvements over v1:
 import asyncio
 import logging
 import argparse
+import random
 import sys
 from datetime import datetime, timezone
 import yaml
@@ -783,16 +784,58 @@ async def _iteration(
         )
 
     cfg["_current_market_end_date_iso"] = end_date_iso
+
+    # ── Async Latency: simulate Polygon block inclusion delay ─────────────
+    # After signal fires, real tx waits 1.5-4s to be included in a block.
+    # During this time MMs reprice the book. We re-fetch fresh book data
+    # so the fill executes against the post-impulse order book, not the
+    # stale snapshot that generated the signal.
+    sim_cfg = cfg.get("simulation", {})
+    latency_min = float(sim_cfg.get("latency_min_sec", 0.0))
+    latency_max = float(sim_cfg.get("latency_max_sec", 0.0))
+    if latency_max > 0:
+        delay = random.uniform(latency_min, latency_max)
+        _print_status_newline()
+        log.info("Simulating Polygon tx latency: %.1fs...", delay)
+        await asyncio.sleep(delay)
+
+        # Re-fetch fresh order book after the delay
+        try:
+            if use_ws and book_feed is not None:
+                fresh_book = book_feed.get_latest()
+                if fresh_book is not None:
+                    book = fresh_book
+                    log.info("Book refreshed from WS after latency delay")
+                else:
+                    book = await fetch_polymarket_book_async(cfg, market_id)
+                    log.info("Book refreshed from HTTP after latency delay")
+            else:
+                book = await fetch_polymarket_book_async(cfg, market_id)
+                log.info("Book refreshed from HTTP after latency delay")
+
+            # Recalculate entry price from the fresh book
+            best_ask = book["best_ask"]
+            best_bid = book["best_bid"]
+            entry_price = best_ask if side == "YES" else (1.0 - best_bid)
+        except Exception as exc:
+            log.warning("Book re-fetch after latency failed: %s — using stale book", exc)
+
     state = open_position(
         state, side, entry_price, size_usd, market_id, cfg,
         book_data=book, sl_pct=sl_pct, tp_pct=tp_pct,
     )
+
+    # TX drop: open_position returns state unchanged if tx was dropped
+    new_pos = state["virtual_portfolio"].get("active_position")
+    if new_pos is None:
+        save_state(state, cfg)
+        return
+
     # Reset WS extremums NOW so the next iteration tracks spikes only from this moment
     if use_ws and book_feed is not None:
         book_feed.get_and_reset_extremums()
     save_state(state, cfg)
 
-    new_pos = state["virtual_portfolio"]["active_position"]
     _print_status_newline()
     _print_open(
         side,

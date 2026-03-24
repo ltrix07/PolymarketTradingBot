@@ -111,10 +111,19 @@ def _simulate_fill_price(
 
     Liquidity is estimated from visible order book volume on the relevant side.
     Falls back to $100 when book_data is not provided.
+
+    Adverse Selection Penalty: when require_volume_spike is active, real MMs pull
+    liquidity on BTC impulse — we slash visible volume by adverse_selection_penalty_pct.
     """
     sim_cfg       = cfg.get("simulation", {})
     base_slippage = float(sim_cfg.get("slippage_simulation_pct", 0.001))
     impact_factor = float(sim_cfg.get("market_impact_factor", 0.002))
+
+    # Adverse selection: MMs pull liquidity during volume spikes
+    adverse_penalty = float(sim_cfg.get("adverse_selection_penalty_pct", 0.0))
+    volume_spike_active = cfg.get("strategy", {}).get("entry_filters", {}).get(
+        "require_volume_spike", False
+    )
 
     if book_data is not None:
         # Spread-based slippage: half the current spread is a more realistic
@@ -128,6 +137,11 @@ def _simulate_fill_price(
 
         volume_key = "ask_volume" if is_buy else "bid_volume"
         raw_volume = book_data.get(volume_key, 0.0)
+
+        # Slash visible liquidity when entering on a volume spike impulse
+        if volume_spike_active and adverse_penalty > 0:
+            raw_volume *= (1.0 - adverse_penalty)
+
         liquidity = max(raw_volume * base_price, 10.0)
     else:
         fallback_liquidity = float(sim_cfg.get("liquidity_fallback_usd", 1000.0))
@@ -142,17 +156,72 @@ def _simulate_fill_price(
         return max(base_price * (1.0 - total_slippage), 0.0)
 
 
-def _simulate_partial_fill(requested_size_usd: float, cfg: dict) -> float:
-    """Return the actually-filled USD amount using a random fill percentage.
+def _simulate_partial_fill(
+    requested_size_usd: float,
+    cfg: dict,
+    book_data: dict | None = None,
+    entry_price: float = 0.0,
+    is_buy: bool = True,
+) -> float:
+    """Liquidity-capped partial fill: never fill more than the book offers.
 
-    Fill percentage is drawn uniformly from [partial_fill_min_pct, 1.0].
-    The balance deduction equals only the filled amount.
+    Two-branch logic:
+      1. requested > available  → hard cap at available_usd (take the whole
+         visible book, ignore the rest of the order).
+      2. requested <= available → old random fill [partial_fill_min_pct, 1.0]
+         of the requested amount (plenty of room in the book).
+
+    available_usd = raw_volume * entry_price, optionally reduced by the
+    adverse selection penalty when require_volume_spike is active.
+
+    Falls back to old random fill when book_data is absent.
     """
-    min_fill_pct = float(
-        cfg.get("simulation", {}).get("partial_fill_min_pct", 0.85)
-    )
+    sim_cfg = cfg.get("simulation", {})
+    min_fill_pct = float(sim_cfg.get("partial_fill_min_pct", 0.85))
+
+    if book_data is not None and entry_price > 0:
+        volume_key = "ask_volume" if is_buy else "bid_volume"
+        raw_volume = book_data.get(volume_key, 0.0)
+
+        # Adverse selection: MMs pull liquidity during volume spikes
+        adverse_penalty = float(sim_cfg.get("adverse_selection_penalty_pct", 0.0))
+        volume_spike_active = cfg.get("strategy", {}).get("entry_filters", {}).get(
+            "require_volume_spike", False
+        )
+        if volume_spike_active and adverse_penalty > 0:
+            raw_volume *= (1.0 - adverse_penalty)
+
+        max_available_usd = raw_volume * entry_price
+
+        if max_available_usd > 0:
+            if requested_size_usd > max_available_usd:
+                # Hard cap: take all visible liquidity, ignore remainder
+                return max_available_usd
+            else:
+                # Plenty of room — old random fill
+                fill_pct = random.uniform(min_fill_pct, 1.0)
+                return requested_size_usd * fill_pct
+
+    # No book data — fallback to old random fill
+    fallback_usd = float(sim_cfg.get("liquidity_fallback_usd", 1000.0))
+    if requested_size_usd > fallback_usd:
+        return fallback_usd
     fill_pct = random.uniform(min_fill_pct, 1.0)
     return requested_size_usd * fill_pct
+
+
+# ── Transaction drop simulation ───────────────────────────────────────────────
+
+def _tx_dropped(cfg: dict) -> bool:
+    """Simulate Polygon network tx failure (gas spike, slippage tolerance reject).
+
+    Returns True if the transaction should be considered dropped/failed.
+    Probability is controlled by cfg["simulation"]["tx_drop_rate_pct"] (default 0).
+    """
+    drop_rate = float(cfg.get("simulation", {}).get("tx_drop_rate_pct", 0.0))
+    if drop_rate <= 0:
+        return False
+    return random.random() < drop_rate
 
 
 # ── Core execution ────────────────────────────────────────────────────────────
@@ -174,11 +243,22 @@ def open_position(
     and passed in; they are stored in the position for check_sl_tp() to use.
 
     Balance deduction = filled_size_usd (not requested size_usd).
+    Returns state unchanged if the simulated transaction is dropped.
     """
     from risk import compute_dynamic_sl_tp  # late import avoids circular dep
 
-    # Partial fill: only a fraction of the requested order fills
-    filled_size_usd = _simulate_partial_fill(size_usd, cfg)
+    # Simulate Polygon tx drop
+    if _tx_dropped(cfg):
+        import logging
+        logging.getLogger(__name__).warning(
+            "TX_DROP: open_position tx rejected (gas/slippage). Position NOT opened."
+        )
+        return state
+
+    # Partial fill: capped by available book liquidity
+    filled_size_usd = _simulate_partial_fill(
+        size_usd, cfg, book_data=book_data, entry_price=entry_price, is_buy=True,
+    )
     fill_pct        = filled_size_usd / size_usd
 
     # Market impact: larger order in thin book → worse entry price
@@ -229,10 +309,21 @@ def close_position(
     Use this for Hard TP (Maker limit order — no slippage by definition).
 
     PnL = (qty * resolution_price) - filled_size_usd
+
+    TX drop simulation applies only to SL/TP (user-initiated sell txs).
+    WIN/LOSS/DRAW are on-chain resolutions and always succeed.
     """
     portfolio = state["virtual_portfolio"]
     position  = portfolio.get("active_position")
     if position is None:
+        return state
+
+    # Simulate Polygon tx drop for user-initiated exits only
+    if result in ("SL", "TP") and _tx_dropped(cfg):
+        import logging
+        logging.getLogger(__name__).warning(
+            "TX_DROP: close_position (%s) tx rejected. Position stays open.", result
+        )
         return state
 
     fee_pct     = float(cfg.get("simulation", {}).get("fee_simulation_pct", 0.0))

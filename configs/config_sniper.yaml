@@ -86,6 +86,11 @@ simulation:
   market_impact_factor: 0.002
   liquidity_fallback_usd: 1000.0
   partial_fill_min_pct: 0.85
+  # ── Pessimization: realistic Polygon/CLOB simulation ──
+  adverse_selection_penalty_pct: 0.75   # MMs pull 75% liquidity on BTC volume spike
+  tx_drop_rate_pct: 0.10                # 10% chance tx rejected (gas/slippage tolerance)
+  latency_min_sec: 1.5                  # Polygon block inclusion delay — min (seconds)
+  latency_max_sec: 4.0                  # Polygon block inclusion delay — max (seconds)
 
 endpoints:
   polymarket_clob: "https://clob.polymarket.com"
