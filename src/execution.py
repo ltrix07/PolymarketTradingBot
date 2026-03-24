@@ -304,13 +304,15 @@ def close_position(
       - result == "WIN"  : market resolved for our side → each token pays $1
       - result == "LOSS" : market resolved against us   → each token pays $0
       - result == "SL" or "TP" : early exit — sell tokens at exit_price with slippage
+      - result == "TIME_STOP"     : early exit — position timed out (dead market)
+      - result == "REVERSE_CLOSE" : early exit — opposite MACD signal detected
 
     skip_slippage=True bypasses _simulate_fill_price() and uses exit_price directly.
     Use this for Hard TP (Maker limit order — no slippage by definition).
 
     PnL = (qty * resolution_price) - filled_size_usd
 
-    TX drop simulation applies only to SL/TP (user-initiated sell txs).
+    TX drop simulation applies to SL/TP/TIME_STOP/REVERSE_CLOSE (user-initiated sell txs).
     WIN/LOSS/DRAW are on-chain resolutions and always succeed.
     """
     portfolio = state["virtual_portfolio"]
@@ -319,7 +321,7 @@ def close_position(
         return state
 
     # Simulate Polygon tx drop for user-initiated exits only
-    if result in ("SL", "TP") and _tx_dropped(cfg):
+    if result in ("SL", "TP", "TIME_STOP", "REVERSE_CLOSE") and _tx_dropped(cfg):
         import logging
         logging.getLogger(__name__).warning(
             "TX_DROP: close_position (%s) tx rejected. Position stays open.", result
@@ -336,7 +338,8 @@ def close_position(
     elif result == "LOSS":
         resolution_price = 0.0
     else:
-        # SL or TP: early exit — Hard TP uses exact limit price, others apply slippage
+        # SL, TP, TIME_STOP, or REVERSE_CLOSE: early exit — sell tokens at exit_price
+        # Hard TP uses exact limit price, others apply slippage
         if skip_slippage:
             resolution_price = exit_price
         else:

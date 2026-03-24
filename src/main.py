@@ -134,6 +134,10 @@ def _print_close(
         label = "TAKE PROFIT"
     elif trigger == "SL":
         label = "STOP LOSS (trailing)" if is_trailing else "STOP LOSS"
+    elif trigger == "TIME_STOP":
+        label = "TIME STOP"
+    elif trigger == "REVERSE_CLOSE":
+        label = "REVERSE CLOSE"
     else:
         label = "EXPIRED"
     if label_suffix:
@@ -591,6 +595,82 @@ async def _iteration(
             ws_extremums=ws_extremums,
         )
         state["virtual_portfolio"] = portfolio
+
+    # ── 6a. TIME-STOP CHECK ──────────────────────────────────────────────────
+    risk_cfg_iter = cfg.get("risk_management", {})
+    if (
+        pos is not None
+        and risk_cfg_iter.get("use_time_stop", False)
+    ):
+        time_stop_sec = float(risk_cfg_iter.get("time_stop_seconds", 120))
+        time_stop_max_loss = float(risk_cfg_iter.get("time_stop_max_loss_pct", 0.02))
+        tp_pct_pos = float(pos.get("tp_pct", risk_cfg_iter.get("take_profit_pct", 0.10)))
+
+        pos_ts = pos.get("timestamp")
+        if pos_ts:
+            pos_dt = datetime.fromisoformat(pos_ts)
+            if pos_dt.tzinfo is None:
+                pos_dt = pos_dt.replace(tzinfo=timezone.utc)
+            age_sec = (datetime.now(timezone.utc) - pos_dt).total_seconds()
+
+            if age_sec > time_stop_sec:
+                exit_p = get_exit_price(pos, best_bid, best_ask)
+                entry_p = pos["entry_price"]
+                if entry_p > 0:
+                    pnl_pct = (exit_p - entry_p) / entry_p
+                else:
+                    pnl_pct = 0.0
+
+                # Close only if PnL is in the "dead zone": small loss or unrealised gain < TP
+                if -time_stop_max_loss <= pnl_pct < tp_pct_pos:
+                    state = close_position(state, exit_p, "TIME_STOP", cfg, book_data=book)
+                    trade = state["trade_history"][-1]
+                    _print_status_newline()
+                    _print_close(
+                        "TIME_STOP",
+                        pos["entry_price"],
+                        trade["exit_price"],
+                        trade["pnl"],
+                        state["virtual_portfolio"]["balance_usd"],
+                        label_suffix=f"({int(age_sec)}s held)",
+                    )
+                    save_state(state, cfg)
+                    return
+
+    # ── 6b. REVERSE-CLOSE CHECK ──────────────────────────────────────────────
+    if (
+        pos is not None
+        and risk_cfg_iter.get("use_reverse_close", False)
+    ):
+        # Calculate BTC price at market open for signal context
+        market_open_price = _get_market_open_btc_price(end_date_iso, candles)
+
+        reverse_signal = generate_signal(
+            candles, cfg, book_data=book,
+            is_last_candle_open=use_live_candles,
+            market_open_price=market_open_price,
+        )
+        # If MACD gives opposite signal to our open position, close immediately
+        pos_side = pos.get("side", "")
+        is_reverse = (
+            (pos_side == "YES" and reverse_signal == "BUY_NO")
+            or (pos_side == "NO" and reverse_signal == "BUY_YES")
+        )
+        if is_reverse:
+            exit_p = get_exit_price(pos, best_bid, best_ask)
+            state = close_position(state, exit_p, "REVERSE_CLOSE", cfg, book_data=book)
+            trade = state["trade_history"][-1]
+            _print_status_newline()
+            _print_close(
+                "REVERSE_CLOSE",
+                pos["entry_price"],
+                trade["exit_price"],
+                trade["pnl"],
+                state["virtual_portfolio"]["balance_usd"],
+                label_suffix=f"(signal → {reverse_signal})",
+            )
+            save_state(state, cfg)
+            return
 
     # ── 7. SL / TP CHECK ──────────────────────────────────────────────────────
     use_sl_tp = cfg.get("risk_management", {}).get("use_sl_tp", True)

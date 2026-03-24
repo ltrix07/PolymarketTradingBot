@@ -58,6 +58,14 @@ risk_management:
   atr_sl_multiplier: 15.0
   atr_tp_multiplier: 20.0
   
+  # Early exit: Time-Stop (close stale positions that go nowhere)
+  use_time_stop: true
+  time_stop_seconds: 120            # Max hold time before force-closing a "dead" position
+  time_stop_max_loss_pct: 0.02      # Only time-stop if unrealised loss ≤ 2% (else wait for SL)
+
+  # Early exit: Reverse-Close (close on opposite MACD signal)
+  use_reverse_close: true
+
   cooldown_after_sl_sec: 60        # Пауза после Stop Loss перед новым входом
 
   # 2. Отключаем трейлинг-стоп, чтобы позиция не закрывалась при откатах

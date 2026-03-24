@@ -97,8 +97,21 @@ def analyse_bot(cfg: dict) -> dict:
     wins = sum(1 for t in history if t.get("result") == "WIN")
     losses = sum(1 for t in history if t.get("result") == "LOSS")
     draws = sum(1 for t in history if t.get("result") == "DRAW")
-    total_decided = wins + losses
-    win_rate = (wins / total_decided * 100) if total_decided else 0.0
+    time_stops = sum(1 for t in history if t.get("result") == "TIME_STOP")
+    rev_closes = sum(1 for t in history if t.get("result") == "REVERSE_CLOSE")
+
+    # Early exits (TP/SL) that resulted in profit/loss
+    tp_count = sum(1 for t in history if t.get("result") == "TP")
+    sl_count = sum(1 for t in history if t.get("result") == "SL")
+
+    # Win rate: count trades with a definitive outcome (WIN, LOSS, TP, SL).
+    # TIME_STOP and REVERSE_CLOSE are "neutral" exits — exclude from win rate
+    # denominator to avoid penalising the bot for cutting dead positions.
+    tp_wins = sum(1 for t in history if t.get("result") == "TP" and t.get("pnl", 0) > 0)
+    sl_wins = sum(1 for t in history if t.get("result") == "SL" and t.get("pnl", 0) > 0)
+    total_decided = wins + losses + tp_count + sl_count
+    total_wins = wins + tp_wins + sl_wins
+    win_rate = (total_wins / total_decided * 100) if total_decided else 0.0
 
     active = portfolio.get("active_position")
     if active:
@@ -116,6 +129,8 @@ def analyse_bot(cfg: dict) -> dict:
         "wins": wins,
         "losses": losses,
         "draws": draws,
+        "time_stops": time_stops,
+        "rev_closes": rev_closes,
         "win_rate": win_rate,
         "status": status_str,
         "available": True,
@@ -162,11 +177,13 @@ def build_report(bots: list[dict]) -> str:
         draw_icon = "⚪" if bot.get("draws", 0) > 0 else ""
 
         draw_str = f" | {bot.get('draws', 0)} {draw_icon}" if bot.get("draws", 0) > 0 else ""
+        ts_str = f" | {bot.get('time_stops', 0)} ⏱" if bot.get("time_stops", 0) > 0 else ""
+        rc_str = f" | {bot.get('rev_closes', 0)} 🔄" if bot.get("rev_closes", 0) > 0 else ""
         lines += [
             f"🤖 *{i}. {bot['name']}*",
             f"├ 💰 Баланс: ${bot['balance']:.2f} ({pnl_pct_str})",
             f"├ 🎯 Win Rate: {bot['win_rate']:.0f}% "
-            f"({bot['wins']} {win_icon} | {bot['losses']} {loss_icon}{draw_str})",
+            f"({bot['wins']} {win_icon} | {bot['losses']} {loss_icon}{draw_str}{ts_str}{rc_str})",
             f"└ 🔄 Статус: {bot['status']}",
             "",
         ]
