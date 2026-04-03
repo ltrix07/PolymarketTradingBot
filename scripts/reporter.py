@@ -31,8 +31,14 @@ def load_configs() -> list[dict]:
         print(f"[WARN] configs/ directory not found at {CONFIGS_DIR}. ")
         return []
 
+    # 🛑 СПИСОК КОНФИГОВ-ШАБЛОНОВ (Их крутит Дирижер, скрываем из отчета)
+    IGNORE_LIST = ["config_sniper.yaml", "config_trend.yaml", "config_volume.yaml"]
+
     configs = []
     for path in sorted(CONFIGS_DIR.glob("*.yaml")):
+        if path.name in IGNORE_LIST:
+            continue  # Пропускаем файл, идем к следующему
+
         try:
             with open(path, encoding="utf-8") as f:
                 cfg = yaml.safe_load(f)
