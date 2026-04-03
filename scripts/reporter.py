@@ -21,7 +21,6 @@ ROOT = Path(__file__).resolve().parent.parent
 CONFIGS_DIR = ROOT / "configs"
 DATA_DIR = ROOT / "data"
 
-
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
@@ -29,15 +28,7 @@ DATA_DIR = ROOT / "data"
 def load_configs() -> list[dict]:
     """Return list of parsed configs from configs/*.yaml (sorted by filename)."""
     if not CONFIGS_DIR.exists():
-        print(f"[WARN] configs/ directory not found at {CONFIGS_DIR}. "
-              "Falling back to root config.yaml.")
-        root_cfg = ROOT / "config.yaml"
-        if root_cfg.exists():
-            with open(root_cfg, encoding="utf-8") as f:
-                cfg = yaml.safe_load(f)
-            cfg["_source"] = str(root_cfg)
-            return [cfg]
-        print("[ERROR] No config files found.")
+        print(f"[WARN] configs/ directory not found at {CONFIGS_DIR}. ")
         return []
 
     configs = []
@@ -50,14 +41,15 @@ def load_configs() -> list[dict]:
         except Exception as exc:
             print(f"[WARN] Failed to parse {path.name}: {exc}")
 
-    if not configs:
-        print(f"[WARN] No *.yaml files in {CONFIGS_DIR}.")
     return configs
 
 
-def load_state(state_filename: str) -> dict | None:
+def load_state(state_filepath: str) -> dict | None:
     """Load state JSON for a bot. Returns None if file is missing or invalid."""
-    path = DATA_DIR / state_filename
+    # Извлекаем только имя файла, чтобы избежать дублирования путей (например, data/data/state.json)
+    filename = Path(state_filepath).name
+    path = DATA_DIR / filename
+    
     if not path.exists():
         return None
     try:
@@ -75,8 +67,15 @@ def load_state(state_filename: str) -> dict | None:
 def analyse_bot(cfg: dict) -> dict:
     """Extract all metrics for one bot config. Returns a metrics dict."""
     strategy_name = cfg.get("strategy", {}).get("name", "Unknown")
+    
+    # 🌟 МАГИЯ ДЛЯ ДИРИЖЕРА: Если это гибридный конфиг, переименовываем его для отчета
+    if "hybrid" in cfg.get("_source", "").lower():
+        strategy_name = "🧠 Дирижер (Hybrid)"
+
     initial_balance = cfg.get("risk_management", {}).get("initial_balance_usd", 1000.0)
-    state_file = cfg.get("simulation", {}).get("state_file", "state.json")
+    
+    # Ищем путь к стейт-файлу в разных блоках (на случай разной структуры конфигов)
+    state_file = cfg.get("storage", {}).get("state_file") or cfg.get("simulation", {}).get("state_file", "state.json")
 
     state = load_state(state_file)
 
@@ -100,21 +99,32 @@ def analyse_bot(cfg: dict) -> dict:
     time_stops = sum(1 for t in history if t.get("result") == "TIME_STOP")
     rev_closes = sum(1 for t in history if t.get("result") == "REVERSE_CLOSE")
 
-    # Early exits (TP/SL) that resulted in profit/loss
     tp_count = sum(1 for t in history if t.get("result") == "TP")
     sl_count = sum(1 for t in history if t.get("result") == "SL")
 
-    # Win rate: count trades with a definitive outcome (WIN, LOSS, TP, SL).
-    # TIME_STOP and REVERSE_CLOSE are "neutral" exits — exclude from win rate
-    # denominator to avoid penalising the bot for cutting dead positions.
     tp_wins = sum(1 for t in history if t.get("result") == "TP" and t.get("pnl", 0) > 0)
     sl_wins = sum(1 for t in history if t.get("result") == "SL" and t.get("pnl", 0) > 0)
     total_decided = wins + losses + tp_count + sl_count
     total_wins = wins + tp_wins + sl_wins
     win_rate = (total_wins / total_decided * 100) if total_decided else 0.0
 
+    # 🚨 HEALTH CHECK: Проверяем, не завис ли бот (если стейт не обновлялся больше 20 минут)
+    is_dead = False
+    last_update_str = portfolio.get("last_update")
+    if last_update_str:
+        try:
+            last_update = datetime.fromisoformat(last_update_str)
+            # Сравниваем с текущим временем UTC
+            if (datetime.now(timezone.utc) - last_update).total_seconds() > 20 * 60:
+                is_dead = True
+        except ValueError:
+            pass
+
     active = portfolio.get("active_position")
-    if active:
+    
+    if is_dead:
+        status_str = "🔴 ОСТАНОВЛЕН (Нет связи / Пауза)"
+    elif active:
         side = active.get("side", "?")
         status_str = f"📈 В сделке ({side})"
     else:
@@ -136,7 +146,6 @@ def analyse_bot(cfg: dict) -> dict:
         "available": True,
     }
 
-
 # ---------------------------------------------------------------------------
 # Report formatting
 # ---------------------------------------------------------------------------
@@ -144,15 +153,13 @@ def analyse_bot(cfg: dict) -> dict:
 def sign(value: float) -> str:
     return f"+${value:.2f}" if value >= 0 else f"-${abs(value):.2f}"
 
-
 def build_report(bots: list[dict]) -> str:
     now_utc = datetime.now(timezone.utc)
-    date_str = now_utc.strftime("%-d %B, %H:%M UTC")  # e.g. "20 Марта, 12:00 UTC"
+    date_str = now_utc.strftime("%-d %B, %H:%M UTC")
 
     available = [b for b in bots if b["available"]]
     unavailable = [b for b in bots if not b["available"]]
 
-    # Sort available bots by PnL descending
     available.sort(key=lambda b: b["pnl"], reverse=True)
 
     lines = [
@@ -209,40 +216,36 @@ def build_report(bots: list[dict]) -> str:
 
     return "\n".join(lines)
 
-
 # ---------------------------------------------------------------------------
 # Telegram
 # ---------------------------------------------------------------------------
 
-def send_telegram(text: str, token: str, chat_id: str, proxy: str | None) -> None:
+def send_telegram(text: str, token: str, chat_id: str) -> None:
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
         "chat_id": chat_id,
         "text": text,
         "parse_mode": "Markdown",
     }
-    proxies = {"http": proxy, "https": proxy} if proxy else None
-
+    
+    # ❌ ПРОКСИ УБРАНЫ: Запрос идет напрямую через чистый интернет сервера
     try:
-        resp = requests.post(url, json=payload, proxies=proxies, timeout=15)
+        resp = requests.post(url, json=payload, timeout=15)
         resp.raise_for_status()
         print("[OK] Report sent to Telegram.")
     except requests.RequestException as exc:
         print(f"[ERROR] Telegram send failed: {exc}")
         sys.exit(1)
 
-
-def extract_telegram_creds(configs: list[dict]) -> tuple[str, str, str | None]:
-    """Pick Telegram token, chat_id and proxy from the first config that has them."""
+def extract_telegram_creds(configs: list[dict]) -> tuple[str, str]:
+    """Pick Telegram token and chat_id from the first config that has them."""
     for cfg in configs:
         endpoints = cfg.get("endpoints", {})
         token = endpoints.get("telegram_bot_token", "")
         chat_id = str(endpoints.get("telegram_chat_id", ""))
-        proxy = endpoints.get("proxy") or None
         if token and chat_id:
-            return token, chat_id, proxy
+            return token, chat_id
     raise ValueError("No Telegram credentials found in any config file.")
-
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -257,11 +260,10 @@ def main() -> None:
     bots = [analyse_bot(cfg) for cfg in configs]
 
     report = build_report(bots)
-    print("\n" + report + "\n")  # also print locally for quick debugging
+    print("\n" + report + "\n")
 
-    token, chat_id, proxy = extract_telegram_creds(configs)
-    send_telegram(report, token, chat_id, proxy)
-
+    token, chat_id = extract_telegram_creds(configs)
+    send_telegram(report, token, chat_id)
 
 if __name__ == "__main__":
     main()
