@@ -46,8 +46,8 @@ strategy:
 risk_management:
   initial_balance_usd: 1000.0
   position_size_pct: 0.03       # Small bets — 3% per trade
-  stop_loss_pct: 0.07           # 7% SL — must clear Polymarket spread
-  take_profit_pct: 0.10         # 10% TP
+  stop_loss_pct: 0.12           # 7% SL — must clear Polymarket spread
+  take_profit_pct: 0.15         # 10% TP
   max_daily_loss_pct: 0.15      # 15% daily limit (room for many trades)
   min_time_before_expiry_sec: 90   # Enter earlier — wider opportunity window
   max_time_before_expiry_sec: 350
@@ -58,8 +58,8 @@ risk_management:
 
   use_atr_dynamic: true
   atr_period: 14
-  atr_sl_multiplier: 15.0      # Must produce SL > spread (~4-6%)
-  atr_tp_multiplier: 22.0      # TP wide enough to clear spread + profit
+  atr_sl_multiplier: 25.0      # Must produce SL > spread (~4-6%)
+  atr_tp_multiplier: 30.0      # TP wide enough to clear spread + profit
 
   sl_confirm_seconds: 10       # Wait 10s to confirm SL breach is real, not a spike
   cooldown_after_sl_sec: 20    # Quick re-entry after SL
