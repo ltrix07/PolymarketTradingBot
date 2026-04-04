@@ -74,9 +74,16 @@ def prepare_hybrid_config(base_mode):
         with open(base_config_path, 'r', encoding='utf-8') as f:
             config = yaml.safe_load(f)
             
+        # ИСПРАВЛЕНИЕ ЗДЕСЬ:
+        # Пишем и в simulation, и в storage (чтобы точно подхватилось)
+        # И указываем просто имя файла, так как движок сам добавляет папку data/
+        if 'simulation' not in config:
+            config['simulation'] = {}
+        config['simulation']['state_file'] = "state_hybrid.json"
+        
         if 'storage' not in config:
             config['storage'] = {}
-        config['storage']['state_file'] = HYBRID_STATE_FILE
+        config['storage']['state_file'] = "state_hybrid.json"
         
         with open(HYBRID_CONFIG_FILE, 'w', encoding='utf-8') as f:
             yaml.dump(config, f, default_flow_style=False)

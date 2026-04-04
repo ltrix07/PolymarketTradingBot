@@ -31,13 +31,18 @@ def load_configs() -> list[dict]:
         print(f"[WARN] configs/ directory not found at {CONFIGS_DIR}. ")
         return []
 
-    # 🛑 СПИСОК КОНФИГОВ-ШАБЛОНОВ (Их крутит Дирижер, скрываем из отчета)
-    IGNORE_LIST = ["config_sniper.yaml", "config_trend.yaml", "config_volume.yaml"]
+    # 🟢 БЕЛЫЙ СПИСОК: Репортер будет читать ТОЛЬКО эти файлы
+    ALLOWED_LIST = [
+        "config_hybrid.yaml", 
+        "config_scalper.yaml", 
+        "config_balanced.yaml"
+    ]
 
     configs = []
     for path in sorted(CONFIGS_DIR.glob("*.yaml")):
-        if path.name in IGNORE_LIST:
-            continue  # Пропускаем файл, идем к следующему
+        # Если файла нет в белом списке - жестко игнорируем его
+        if path.name not in ALLOWED_LIST:
+            continue
 
         try:
             with open(path, encoding="utf-8") as f:
