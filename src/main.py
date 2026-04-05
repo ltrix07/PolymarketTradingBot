@@ -275,14 +275,22 @@ async def run_loop(cfg: dict) -> None:
     atr_mode   = "ATR-dynamic" if cfg["risk_management"].get("use_atr_dynamic", True) else "fixed"
     trail_mode = f"trailing {'✓' if cfg['risk_management'].get('trailing_stop_enabled', True) else '✗'}"
 
+    rm_cfg = cfg.get('risk_management', {})
+    
+    # Безопасно получаем новые значения (с фолбэком на 0, если вдруг ключа нет)
+    sl_mult = rm_cfg.get('atr_sl_multiplier', 0)
+    tp_mult = rm_cfg.get('atr_tp_multiplier', 0)
+    max_loss = rm_cfg.get('max_daily_loss_pct', 0) * 100
+    pos_size = rm_cfg.get('position_size_pct', 0) * 100
+
     print(f"\n{_B}{_C}{_bar('═')}{_RS}")
     print(f"  {_B}POLYMARKET PAPER TRADING BOT  [async]{_RS}")
     print(f"{_C}{_bar()}{_RS}")
     print(
-        f"  SL {cfg['risk_management']['stop_loss_pct']*100:.0f}%  "
-        f"TP {cfg['risk_management']['take_profit_pct']*100:.0f}%  "
-        f"Max daily loss {cfg['risk_management']['max_daily_loss_pct']*100:.0f}%  "
-        f"Size {cfg['risk_management']['position_size_pct']*100:.0f}%"
+        f"  SL ATRx{sl_mult}  "      # Теперь показываем множитель ATR вместо жестких %
+        f"TP ATRx{tp_mult}  "      # Теперь показываем множитель ATR вместо жестких %
+        f"Max daily loss {max_loss:.0f}%  "
+        f"Size {pos_size:.0f}%"
     )
     print(f"  Risk: {_C}{atr_mode}{_RS}  {_C}{trail_mode}{_RS}")
     print(f"{_C}{_bar('═')}{_RS}\n")
