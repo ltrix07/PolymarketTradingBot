@@ -86,9 +86,13 @@ def prepare_hybrid_config(base_mode):
             config['simulation'] = {}
         config['simulation']['state_file'] = "state_hybrid.json"
 
+        config['simulation']['log_file'] = "trades_hybrid.csv"
+
         if 'storage' not in config:
             config['storage'] = {}
         config['storage']['state_file'] = "state_hybrid.json"
+
+        config['storage']['log_file'] = "trades_hybrid.csv"
 
         with open(HYBRID_CONFIG_FILE, 'w', encoding='utf-8') as f:
             yaml.dump(config, f, default_flow_style=False)
@@ -153,7 +157,7 @@ def orchestrate():
 if __name__ == "__main__":
     with open(HYBRID_LOG_FILE, "w", encoding="utf-8") as f:
         f.write(f"[{get_time()}] --- НОВЫЙ ЗАПУСК ДИРИЖЕРА ---\n")
-        
+
     print(f"[{get_time()}] 🧠 Гибридный Мозг (Дирижер) запущен!")
     print(f"[{get_time()}] Баланс и позиции синхронизируются через {HYBRID_STATE_FILE}")
 
