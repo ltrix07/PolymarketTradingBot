@@ -151,6 +151,9 @@ def orchestrate():
     switch_mode(target_mode)
 
 if __name__ == "__main__":
+    with open(HYBRID_LOG_FILE, "w", encoding="utf-8") as f:
+        f.write(f"[{get_time()}] --- НОВЫЙ ЗАПУСК ДИРИЖЕРА ---\n")
+        
     print(f"[{get_time()}] 🧠 Гибридный Мозг (Дирижер) запущен!")
     print(f"[{get_time()}] Баланс и позиции синхронизируются через {HYBRID_STATE_FILE}")
 
