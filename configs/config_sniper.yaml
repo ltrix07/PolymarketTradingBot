@@ -51,8 +51,6 @@ strategy:
 risk_management:
   initial_balance_usd: 1000.0
   position_size_pct: 0.08       # Larger bets — 8% per high-conviction trade
-  stop_loss_pct: 0.12          # 7% SL — must clear spread
-  take_profit_pct: 0.15         # 12% TP — R:R = 1:1.7
   max_daily_loss_pct: 0.08      # Tighter 8% daily limit (fewer trades to recover)
   min_time_before_expiry_sec: 120
   max_time_before_expiry_sec: 400
@@ -63,11 +61,11 @@ risk_management:
 
   use_atr_dynamic: true
   atr_period: 14
-  atr_sl_multiplier: 15.0
-  atr_tp_multiplier: 30.0
+  atr_sl_multiplier: 3.0        # SL beyond market noise
+  atr_tp_multiplier: 4.5        # TP = 1.5x SL distance
 
-  sl_confirm_seconds: 15       # Wait 15s to confirm SL breach is real, not a spike
-  cooldown_after_sl_sec: 60    # Patient re-entry after loss
+  sl_confirm_seconds: 15        # Wait 15s to confirm SL breach is real, not a spike
+  cooldown_after_sl_sec: 60     # Patient re-entry after loss
 
   trailing_stop_enabled: true
   trailing_stop_atr_multiplier: 1.5

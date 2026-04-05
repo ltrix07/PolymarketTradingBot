@@ -11,9 +11,10 @@ from datetime import datetime
 
 # Настройки рынка
 SYMBOL = "BTCUSDT"
-TIMEFRAME = "15m"
+TIMEFRAME = "5m"
 ADX_PERIOD = 14
-CHECK_INTERVAL_SEC = 60 * 15  # Проверка каждые 15 минут
+CHECK_INTERVAL_SEC = 60 * 15
+POLL_INTERVAL_SEC = 10  # Sub-interval for crash detection
 
 # Файлы
 HYBRID_STATE_FILE = "data/state_hybrid.json"
@@ -30,6 +31,7 @@ os.makedirs(LOGS_DIR, exist_ok=True)
 HYBRID_LOG_FILE = os.path.join(LOGS_DIR, "hybrid_bot.log")
 
 active_process = None
+active_log_file = None  # Global handle — closed explicitly on terminate
 current_mode = "pause"  # 'sniper', 'trend', 'pause'
 
 def get_time():
@@ -37,16 +39,19 @@ def get_time():
 
 def get_market_data():
     """Получает данные с Binance и рассчитывает ADX"""
-    url = f"https://api.binance.com/api/v3/klines?symbol={SYMBOL}&interval={TIMEFRAME}&limit={ADX_PERIOD * 3}"
+    url = f"https://api.binance.com/api/v3/klines?symbol={SYMBOL}&interval={TIMEFRAME}&limit=150"
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
         data = response.json()
-        
-        df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'])
+
+        df = pd.DataFrame(data, columns=[
+            'timestamp', 'open', 'high', 'low', 'close', 'volume',
+            'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
+        ])
         for col in ['high', 'low', 'close']:
             df[col] = df[col].astype(float)
-            
+
         adx_df = ta.adx(df['high'], df['low'], df['close'], length=ADX_PERIOD)
         return adx_df[f'ADX_{ADX_PERIOD}'].iloc[-1]
     except Exception as e:
@@ -57,12 +62,15 @@ def has_active_position():
     """Проверяет файл состояния гибрида на наличие открытых позиций"""
     if not os.path.exists(HYBRID_STATE_FILE):
         return False
-        
+
     try:
         with open(HYBRID_STATE_FILE, 'r', encoding='utf-8') as f:
             state = json.load(f)
             portfolio = state.get("virtual_portfolio", {})
             return portfolio.get("active_position") is not None
+    except json.JSONDecodeError:
+        # File is being written — safe block: assume position is open
+        return True
     except Exception as e:
         print(f"[{get_time()}] ⚠️ Ошибка чтения стейта: {e}")
         return True
@@ -73,56 +81,55 @@ def prepare_hybrid_config(base_mode):
     try:
         with open(base_config_path, 'r', encoding='utf-8') as f:
             config = yaml.safe_load(f)
-            
-        # ИСПРАВЛЕНИЕ ЗДЕСЬ:
-        # Пишем и в simulation, и в storage (чтобы точно подхватилось)
-        # И указываем просто имя файла, так как движок сам добавляет папку data/
+
         if 'simulation' not in config:
             config['simulation'] = {}
         config['simulation']['state_file'] = "state_hybrid.json"
-        
+
         if 'storage' not in config:
             config['storage'] = {}
         config['storage']['state_file'] = "state_hybrid.json"
-        
+
         with open(HYBRID_CONFIG_FILE, 'w', encoding='utf-8') as f:
             yaml.dump(config, f, default_flow_style=False)
-            
+
     except Exception as e:
         print(f"[{get_time()}] ❌ Ошибка создания гибридного конфига: {e}")
 
 def switch_mode(target_mode):
     """Переключает текущего бота на новый режим"""
-    global active_process, current_mode
-    
+    global active_process, active_log_file, current_mode
+
     if current_mode == target_mode:
         return
 
     if has_active_position():
         print(f"[{get_time()}] ⏳ Тренд изменился на {target_mode.upper()}, но есть АКТИВНАЯ ПОЗИЦИЯ. Ждем закрытия сделки режимом {current_mode.upper()}...")
         return
-        
+
     if active_process is not None:
         print(f"[{get_time()}] 🛑 Останавливаем логику: {current_mode.upper()}")
         active_process.terminate()
         active_process.wait()
         active_process = None
+        if active_log_file is not None:
+            active_log_file.close()
+            active_log_file = None
 
     current_mode = target_mode
-    
+
     if target_mode == "pause":
         print(f"[{get_time()}] ⏸ Бот переведен в режим ПАУЗЫ (рынок неопределен).")
     else:
         prepare_hybrid_config(target_mode)
         print(f"[{get_time()}] 🚀 Запускаем логику: {target_mode.upper()} (Стейт: Гибрид)")
         print(f"[{get_time()}] 📝 Логи сделок пишутся в файл: {HYBRID_LOG_FILE}")
-        
-        # Запускаем процесс, перенаправляя весь вывод в файл
-        log_file = open(HYBRID_LOG_FILE, "a", encoding="utf-8")
+
+        active_log_file = open(HYBRID_LOG_FILE, "a", encoding="utf-8")
         cmd = [sys.executable, "src/main.py", "--config", HYBRID_CONFIG_FILE]
         active_process = subprocess.Popen(
             cmd,
-            stdout=log_file,
+            stdout=active_log_file,
             stderr=subprocess.STDOUT,
             text=True
         )
@@ -131,23 +138,22 @@ def orchestrate():
     adx = get_market_data()
     if adx is None:
         return
-        
+
     print(f"\n[{get_time()}] 📊 Текущий ADX: {adx:.2f}")
-    
-    target_mode = "pause"
-    if adx > 40:
-        target_mode = "trend" 
-    elif adx < 25:
+
+    if adx < 25:
         target_mode = "sniper"
-    else:
+    elif adx <= 40:
         target_mode = "pause"
-        
+    else:
+        target_mode = "trend"
+
     switch_mode(target_mode)
 
 if __name__ == "__main__":
     print(f"[{get_time()}] 🧠 Гибридный Мозг (Дирижер) запущен!")
     print(f"[{get_time()}] Баланс и позиции синхронизируются через {HYBRID_STATE_FILE}")
-    
+
     if not os.path.exists(HYBRID_STATE_FILE):
         os.makedirs("data", exist_ok=True)
         init_state = {
@@ -165,12 +171,25 @@ if __name__ == "__main__":
     try:
         orchestrate()
         while True:
-            # Добавил принт ожидания, чтобы было видно, что скрипт не завис
-            print(f"[{get_time()}] 💤 Ожидание 15 минут до следующей проверки...\n" + "-"*40)
-            time.sleep(CHECK_INTERVAL_SEC)
-            orchestrate()
+            print(f"[{get_time()}] 💤 Ожидание 15 минут до следующей проверки...\n" + "-" * 40)
+            elapsed = 0
+            while elapsed < CHECK_INTERVAL_SEC:
+                time.sleep(POLL_INTERVAL_SEC)
+                elapsed += POLL_INTERVAL_SEC
+                if active_process is not None and active_process.poll() is not None:
+                    print(f"[{get_time()}] ⚠️ Дочерний процесс упал (код: {active_process.returncode}). Принудительный перезапуск...")
+                    active_process = None
+                    if active_log_file is not None:
+                        active_log_file.close()
+                        active_log_file = None
+                    orchestrate()
+                    break
+            else:
+                orchestrate()
     except KeyboardInterrupt:
         if active_process:
             active_process.terminate()
+        if active_log_file:
+            active_log_file.close()
         print(f"\n[{get_time()}] Дирижер остановлен.")
         sys.exit(0)

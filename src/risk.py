@@ -70,9 +70,9 @@ def compute_dynamic_sl_tp(
     Returns (sl_pct, tp_pct) to be stored in the position dict.
     Falls back to config fixed values when ATR is unavailable or disabled.
 
-    Clamps:
-      sl_pct ∈ [2%, 20%]
-      tp_pct ∈ [4%, 50%]
+    When use_atr_dynamic=True: sl_pct = atr_normalized * sl_mult,
+                                tp_pct = atr_normalized * tp_mult (no clamps).
+    Fallback: config stop_loss_pct / take_profit_pct (use_atr_dynamic=False or ATR unavailable).
     """
     risk_cfg = cfg.get("risk_management", {})
     use_atr  = risk_cfg.get("use_atr_dynamic", True)
@@ -85,8 +85,8 @@ def compute_dynamic_sl_tp(
     sl_mult = float(risk_cfg.get("atr_sl_multiplier", 5.0))
     tp_mult = float(risk_cfg.get("atr_tp_multiplier", 10.0))
 
-    sl_pct = max(0.06, min(atr_normalized * sl_mult, 0.20))
-    tp_pct = max(0.08, min(atr_normalized * tp_mult, 0.50))
+    sl_pct = atr_normalized * sl_mult
+    tp_pct = atr_normalized * tp_mult
 
     return sl_pct, tp_pct
 
