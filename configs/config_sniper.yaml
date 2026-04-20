@@ -42,7 +42,7 @@ strategy:
     imbalance_threshold: 0.56
     depth_levels: 5
   entry_filters:
-    trend_ema_period: 50             # Only trade in direction of EMA50 trend
+    trend_ema_period: 120             # Only trade in direction of EMA50 trend
     market_uncertainty_band: 0.15    # Only enter when price is 0.35-0.65 (genuine uncertainty)
     require_volume_spike: true       # Require Binance volume confirmation
     volume_spike_multiplier: 1.3     # Last candle vol > 1.3x average (not too strict)

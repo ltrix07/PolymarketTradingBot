@@ -136,13 +136,14 @@ def _apply_entry_filters(
     if not filters:
         return True
 
+    deadzone = filters.get("deadzone_around_half", 0.02)
+
     # ── Price filters (require book_data) ─────────────────────────────────
     if book_data is not None:
-        # Determine the reference price depending on signal direction
-        if signal == "BUY_YES":
-            ref_price = book_data.get("best_ask")
-        else:
-            ref_price = book_data.get("best_bid")
+        ref_price = book_data.get("best_ask") if signal == "BUY_YES" else book_data.get("best_bid")
+        if ref_price and abs(ref_price - 0.5) < deadzone:
+            logging.info("BLOCKED: entry price %.4f too close to 0.5 coin-flip zone", ref_price)
+            return False
 
         if ref_price is not None:
             uncertainty_band = filters.get("market_uncertainty_band")

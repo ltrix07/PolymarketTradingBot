@@ -75,6 +75,28 @@ def has_active_position():
         print(f"[{get_time()}] ⚠️ Ошибка чтения стейта: {e}")
         return True
 
+def _get_position_age_seconds():
+    """Возвращает возраст активной позиции в секундах или None."""
+    if not os.path.exists(HYBRID_STATE_FILE):
+        return None
+    try:
+        with open(HYBRID_STATE_FILE, 'r', encoding='utf-8') as f:
+            state = json.load(f)
+        pos = state.get("virtual_portfolio", {}).get("active_position")
+        if pos is None:
+            return None
+        ts = pos.get("timestamp")
+        if not ts:
+            return None
+        pos_dt = datetime.fromisoformat(ts)
+        if pos_dt.tzinfo is None:
+            from datetime import timezone
+            pos_dt = pos_dt.replace(tzinfo=timezone.utc)
+        from datetime import timezone
+        return (datetime.now(timezone.utc) - pos_dt).total_seconds()
+    except Exception:
+        return None
+
 def prepare_hybrid_config(base_mode):
     """Создает config_hybrid.yaml на базе нужной стратегии"""
     base_config_path = BASE_CONFIGS[base_mode]
@@ -108,8 +130,12 @@ def switch_mode(target_mode):
         return
 
     if has_active_position():
-        print(f"[{get_time()}] ⏳ Тренд изменился на {target_mode.upper()}, но есть АКТИВНАЯ ПОЗИЦИЯ. Ждем закрытия сделки режимом {current_mode.upper()}...")
-        return
+        position_age = _get_position_age_seconds()
+        if position_age is not None and position_age > 900:
+            print(f"[{get_time()}] ⚠️ Позиция висит {position_age:.0f}с — застрял. Принудительное переключение.")
+        else:
+            print(f"[{get_time()}] ⏳ Тренд изменился на {target_mode.upper()}, но есть АКТИВНАЯ ПОЗИЦИЯ. Ждем закрытия сделки режимом {current_mode.upper()}...")
+            return
 
     if active_process is not None:
         print(f"[{get_time()}] 🛑 Останавливаем логику: {current_mode.upper()}")
@@ -145,10 +171,10 @@ def orchestrate():
 
     print(f"\n[{get_time()}] 📊 Текущий ADX: {adx:.2f}")
 
-    if adx < 25:
+    if adx < 20:
         target_mode = "sniper"
-    elif adx <= 40:
-        target_mode = "pause"
+    elif adx <= 35:
+        target_mode = "volume"
     else:
         target_mode = "trend"
 

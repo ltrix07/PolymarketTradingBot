@@ -42,7 +42,7 @@ strategy:
     imbalance_threshold: 0.53
     depth_levels: 5
   entry_filters:
-    trend_ema_period: 40             # Only trade in direction of EMA40 trend
+    trend_ema_period: 90             # Only trade in direction of EMA40 trend
     require_volume_spike: true
     volume_spike_multiplier: 1.3     # Moderate threshold — catch real moves without over-filtering
     volume_spike_period: 10          # 10-candle average for stable baseline

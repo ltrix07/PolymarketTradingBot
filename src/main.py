@@ -467,7 +467,14 @@ async def _iteration(
     seconds_left = _seconds_until_expiry(end_date_iso)
 
     # ── 1.5. EXPIRY SETTLEMENT ──────────────────────────────────────────────────
-    if pos is not None and seconds_left <= 0:
+    if pos is not None and seconds_left < 90:
+        exit_p = get_exit_price(pos, best_bid, best_ask)
+        entry_p = pos["entry_price"]
+        pnl_pct = (exit_p - entry_p) / entry_p if entry_p > 0 else 0.0
+
+        if pnl_pct < -0.01:
+            state = close_position(state, exit_p, "TIME_STOP", cfg, book_data=book)
+
         side = pos["side"]
 
         # Вычисляем, сколько секунд прошло с момента экспирации
