@@ -2,12 +2,18 @@
 # TREND RIDER — Ride Momentum, Lock Profits
 # ============================================================
 # Philosophy: Only enter clear directional moves confirmed by
-# strong order book imbalance (0.58). Then let the position
-# run with a wide TP target and an aggressive trailing stop
-# (1.2x ATR) that locks profits as price moves in our favor.
-# Price filter (0.35-0.65) avoids extreme odds markets.
+# strong order book imbalance. Then let the position run with
+# a wide TP target and an aggressive trailing stop that locks
+# profits as price moves in our favor. Price filter (0.35-0.65)
+# avoids extreme odds markets.
 # Expected: 3-6 trades/day, ~50-54% win rate,
 #   but winners are larger due to wide TP + trailing stop.
+#
+# CHANGES from previous version:
+#   - trend_ema_period: 60 -> 30  (1h trend still too strict)
+#   - imbalance_threshold: 0.58 -> 0.54  (0.58 required very rare book state)
+#   - min_time_before_expiry_sec: 90 -> 60  (wider entry window)
+#   - max_time_before_expiry_sec: 350 -> 480
 # ============================================================
 
 market:
@@ -39,10 +45,10 @@ strategy:
     overbought: 72          # Relaxed — allow riding strong trends
     oversold: 28
   order_book:
-    imbalance_threshold: 0.58   # Strict — require clear order flow direction
+    imbalance_threshold: 0.54   # Relaxed from 0.58 — still meaningful but triggerable
     depth_levels: 5
   entry_filters:
-    trend_ema_period: 60         # Only trade in direction of EMA40 trend
+    trend_ema_period: 30         # 30m trend filter (was 60 — too strict for 5-min markets)
     min_token_price: 0.35        # Avoid extreme lows (likely resolved)
     max_token_price: 0.65        # Avoid extreme highs (poor R:R)
 
@@ -50,8 +56,8 @@ risk_management:
   initial_balance_usd: 1000.0
   position_size_pct: 0.05       # Standard 5%
   max_daily_loss_pct: 0.10
-  min_time_before_expiry_sec: 90
-  max_time_before_expiry_sec: 350
+  min_time_before_expiry_sec: 60      # Wider entry window (was 90)
+  max_time_before_expiry_sec: 480     # Wider entry window (was 350)
 
   use_sl_tp: true
   use_hard_tp: true
@@ -86,5 +92,5 @@ simulation:
 endpoints:
   polymarket_clob: "https://clob.polymarket.com"
   binance_v3: "https://api.binance.com/api/v3"
-  telegram_bot_token: "8602019058:AAFaJkXq2Uj8OyxC4lJ5dze1gf0fp5KDr6w"
-  telegram_chat_id: "324521546"
+  telegram_bot_token: ""
+  telegram_chat_id: ""
