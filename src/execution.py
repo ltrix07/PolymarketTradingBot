@@ -1,19 +1,30 @@
 """
-execution.py — Mock Broker (Execution Layer).
+execution.py — Broker Layer for Crypto Futures (Paper + Live dispatch).
 
-Simulates Polymarket binary market mechanics:
-  - Buying YES/NO tokens at a price p (0..1)
-  - Tokens qty = filled_size_usd / fill_price
-  - On WIN (market resolves to 1.0): payout = qty * 1.0
-  - On LOSS (market resolves to 0.0): payout = 0
-  - On early exit (SL/TP): payout = qty * exit_price
+Simulates crypto futures (Long/Short) trading in paper mode:
+  LONG:  profit when price rises → PnL = (exit_price - entry_price) * qty
+  SHORT: profit when price falls → PnL = (entry_price - exit_price) * qty
+  Fee:   charged on exit notional → fee_pct * exit_price * qty
 
-New in this version:
-  - Market impact slippage: larger orders in thin books move price more.
-  - Partial fill simulation: orders fill 85-100% of requested size.
-  - Position stores sl_pct, tp_pct (ATR-dynamic), trailing_stop_price, fill_pct.
+Balance accounting (paper mode):
+  open  — balance_usd -= filled_size_usd (margin deducted)
+  close — balance_usd += filled_size_usd + net_pnl (margin returned ± PnL)
 
-No real orders are sent anywhere.
+Prop Firm Daily Drawdown Guard:
+  After each close, if daily_pnl <= -(initial_balance_usd * max_daily_loss_pct),
+  new entries are blocked until 00:00 UTC of the next calendar day.
+  Threshold is anchored to initial_balance_usd (fixed at session start),
+  matching the prop firm standard.
+
+Exports:
+  load_state, save_state, reset_daily_pnl_if_needed
+  open_position(state, side, entry_price, size_usd, symbol, cfg, ...)
+  close_position(state, exit_price, result, cfg, ...)
+
+Execution mode:
+  cfg["execution"]["mode"] == "paper"  — local simulation (default)
+  cfg["execution"]["mode"] == "live"   — real Binance Futures orders
+    → routed through src/binance_client.py (not yet implemented).
 """
 
 import csv
@@ -21,7 +32,7 @@ import json
 import os
 import random
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "state.json")
 
@@ -106,28 +117,18 @@ def _simulate_fill_price(
     Market impact formula:
         total_slippage = base_slippage + impact_factor * (size_usd / liquidity)
 
-    For BUY:  fill_price = base_price * (1 + total_slippage)  [paying more]
-    For SELL: fill_price = base_price * (1 - total_slippage)  [receiving less]
+    For entry BUY (LONG open / SHORT close):
+        fill_price = base_price * (1 + total_slippage)  ← paying more
+    For entry SELL (SHORT open / LONG close):
+        fill_price = base_price * (1 - total_slippage)  ← receiving less
 
-    Liquidity is estimated from visible order book volume on the relevant side.
-    Falls back to $100 when book_data is not provided.
-
-    Adverse Selection Penalty: when require_volume_spike is active, real MMs pull
-    liquidity on BTC impulse — we slash visible volume by adverse_selection_penalty_pct.
+    Binance Futures prices are unbounded (e.g. BTC at 80,000 USD).
     """
     sim_cfg       = cfg.get("simulation", {})
     base_slippage = float(sim_cfg.get("slippage_simulation_pct", 0.001))
     impact_factor = float(sim_cfg.get("market_impact_factor", 0.002))
 
-    # Adverse selection: MMs pull liquidity during volume spikes
-    adverse_penalty = float(sim_cfg.get("adverse_selection_penalty_pct", 0.0))
-    volume_spike_active = cfg.get("strategy", {}).get("entry_filters", {}).get(
-        "require_volume_spike", False
-    )
-
     if book_data is not None:
-        # Spread-based slippage: half the current spread is a more realistic
-        # baseline than the fixed 0.1% default. Polymarket spreads are 0.02–0.08.
         spread = book_data.get("best_ask", base_price) - book_data.get("best_bid", base_price)
         if base_price > 0:
             spread_slippage_pct = max(spread / 2.0, 0.0) / base_price
@@ -138,22 +139,18 @@ def _simulate_fill_price(
         volume_key = "ask_volume" if is_buy else "bid_volume"
         raw_volume = book_data.get(volume_key, 0.0)
 
-        # Slash visible liquidity when entering on a volume spike impulse
-        if volume_spike_active and adverse_penalty > 0:
-            raw_volume *= (1.0 - adverse_penalty)
-
         liquidity = max(raw_volume * base_price, 10.0)
     else:
         fallback_liquidity = float(sim_cfg.get("liquidity_fallback_usd", 1000.0))
         liquidity = fallback_liquidity
 
-    market_impact   = impact_factor * (filled_size_usd / liquidity)
-    total_slippage  = base_slippage + market_impact
+    market_impact  = impact_factor * (filled_size_usd / liquidity)
+    total_slippage = base_slippage + market_impact
 
     if is_buy:
-        return min(base_price * (1.0 + total_slippage), 0.99)
+        return base_price * (1.0 + total_slippage)
     else:
-        return max(base_price * (1.0 - total_slippage), 0.0)
+        return base_price * (1.0 - total_slippage)
 
 
 def _simulate_partial_fill(
@@ -166,43 +163,26 @@ def _simulate_partial_fill(
     """Liquidity-capped partial fill: never fill more than the book offers.
 
     Two-branch logic:
-      1. requested > available  → hard cap at available_usd (take the whole
-         visible book, ignore the rest of the order).
-      2. requested <= available → old random fill [partial_fill_min_pct, 1.0]
-         of the requested amount (plenty of room in the book).
+      1. requested > available  → hard cap at available_usd.
+      2. requested <= available → random fill [partial_fill_min_pct, 1.0].
 
-    available_usd = raw_volume * entry_price, optionally reduced by the
-    adverse selection penalty when require_volume_spike is active.
-
-    Falls back to old random fill when book_data is absent.
+    Falls back to random fill when book_data is absent.
     """
-    sim_cfg = cfg.get("simulation", {})
+    sim_cfg      = cfg.get("simulation", {})
     min_fill_pct = float(sim_cfg.get("partial_fill_min_pct", 0.85))
 
     if book_data is not None and entry_price > 0:
         volume_key = "ask_volume" if is_buy else "bid_volume"
         raw_volume = book_data.get(volume_key, 0.0)
 
-        # Adverse selection: MMs pull liquidity during volume spikes
-        adverse_penalty = float(sim_cfg.get("adverse_selection_penalty_pct", 0.0))
-        volume_spike_active = cfg.get("strategy", {}).get("entry_filters", {}).get(
-            "require_volume_spike", False
-        )
-        if volume_spike_active and adverse_penalty > 0:
-            raw_volume *= (1.0 - adverse_penalty)
-
         max_available_usd = raw_volume * entry_price
 
         if max_available_usd > 0:
             if requested_size_usd > max_available_usd:
-                # Hard cap: take all visible liquidity, ignore remainder
                 return max_available_usd
-            else:
-                # Plenty of room — old random fill
-                fill_pct = random.uniform(min_fill_pct, 1.0)
-                return requested_size_usd * fill_pct
+            fill_pct = random.uniform(min_fill_pct, 1.0)
+            return requested_size_usd * fill_pct
 
-    # No book data — fallback to old random fill
     fallback_usd = float(sim_cfg.get("liquidity_fallback_usd", 1000.0))
     if requested_size_usd > fallback_usd:
         return fallback_usd
@@ -210,63 +190,62 @@ def _simulate_partial_fill(
     return requested_size_usd * fill_pct
 
 
-# ── Transaction drop simulation ───────────────────────────────────────────────
-
-def _tx_dropped(cfg: dict) -> bool:
-    """Simulate Polygon network tx failure (gas spike, slippage tolerance reject).
-
-    Returns True if the transaction should be considered dropped/failed.
-    Probability is controlled by cfg["simulation"]["tx_drop_rate_pct"] (default 0).
-    """
-    drop_rate = float(cfg.get("simulation", {}).get("tx_drop_rate_pct", 0.0))
-    if drop_rate <= 0:
-        return False
-    return random.random() < drop_rate
+def _get_execution_mode(cfg: dict) -> str:
+    """Return the configured execution mode ('paper' | 'live'). Defaults to 'paper'."""
+    return cfg.get("execution", {}).get("mode", "paper").lower()
 
 
 # ── Core execution ────────────────────────────────────────────────────────────
 
 def open_position(
     state: dict,
-    side: str,
+    side: str,             # "LONG" or "SHORT"
     entry_price: float,
-    size_usd: float,
-    market_id: str,
+    size_usd: float,       # Notional size = qty * entry_price; deducted from balance as margin
+    symbol: str,           # e.g. "BTCUSDT"
     cfg: dict,
     book_data: dict | None = None,
     sl_pct: float | None = None,
     tp_pct: float | None = None,
 ) -> dict:
-    """Open a paper trading position with market-impact slippage and partial fill.
+    """Open a futures position.
 
-    sl_pct and tp_pct should be pre-computed by risk.compute_dynamic_sl_tp()
-    and passed in; they are stored in the position for check_sl_tp() to use.
+    Paper mode: local simulation with market-impact slippage and partial fill.
+    Live mode:  delegates to binance_client (not yet implemented).
 
-    Balance deduction = filled_size_usd (not requested size_usd).
-    Returns state unchanged if the simulated transaction is dropped.
+    Side-aware slippage direction:
+      LONG  open → buying  → is_buy=True  (fill_price pushed UP)
+      SHORT open → selling → is_buy=False (fill_price pushed DOWN)
+
+    qty = filled_size_usd / fill_price  (e.g. 0.004 BTC when size=320 USD, price=80,000)
+    Balance is reduced by filled_size_usd (margin); returned on close + net PnL.
+
+    Position dict contains "breakeven_activated": False, managed by risk.update_trailing_stop().
     """
+    mode = _get_execution_mode(cfg)
+    if mode == "live":
+        # TODO(live): route to binance_client.place_market_order / place_limit_order.
+        # See src/binance_client.py for endpoint wiring.
+        raise NotImplementedError(
+            "Live execution not yet implemented — finish binance_client.py and flip execution.mode to 'paper' to keep going."
+        )
+
     from risk import compute_dynamic_sl_tp  # late import avoids circular dep
 
-    # Simulate Polygon tx drop
-    if _tx_dropped(cfg):
-        import logging
-        logging.getLogger(__name__).warning(
-            "TX_DROP: open_position tx rejected (gas/slippage). Position NOT opened."
-        )
-        return state
+    # LONG = buying (is_buy=True), SHORT = selling short (is_buy=False)
+    is_buy = (side == "LONG")
 
-    # Partial fill: capped by available book liquidity
     filled_size_usd = _simulate_partial_fill(
-        size_usd, cfg, book_data=book_data, entry_price=entry_price, is_buy=True,
+        size_usd, cfg, book_data=book_data, entry_price=entry_price, is_buy=is_buy,
     )
-    fill_pct        = filled_size_usd / size_usd
+    fill_pct   = filled_size_usd / size_usd
+    fill_price = _simulate_fill_price(
+        entry_price, filled_size_usd, book_data, cfg, is_buy=is_buy
+    )
 
-    # Market impact: larger order in thin book → worse entry price
-    fill_price = _simulate_fill_price(entry_price, filled_size_usd, book_data, cfg, is_buy=True)
-
+    # qty = number of contracts (e.g., BTC); drives all PnL calculations
     qty = filled_size_usd / fill_price
 
-    # Use pre-computed ATR-based SL/TP when provided, else fallback via config
     if sl_pct is None or tp_pct is None:
         sl_pct, tp_pct = compute_dynamic_sl_tp(None, cfg)
 
@@ -274,17 +253,17 @@ def open_position(
     portfolio["balance_usd"] -= filled_size_usd
     portfolio["active_position"] = {
         "id":                    str(uuid.uuid4()),
-        "side":                  side,
+        "side":                  side,             # "LONG" or "SHORT"
+        "symbol":                symbol,
         "entry_price":           fill_price,
         "qty":                   qty,
         "size_usd":              filled_size_usd,
         "requested_size_usd":    size_usd,
         "fill_pct":              round(fill_pct, 4),
-        "market_id":             market_id,
-        "market_end_date_iso":   cfg.get("_current_market_end_date_iso", ""),
         "sl_pct":                round(sl_pct, 4),
         "tp_pct":                round(tp_pct, 4),
         "trailing_stop_price":   None,
+        "breakeven_activated":   False,            # Managed by risk.update_trailing_stop
         "timestamp":             datetime.now(timezone.utc).isoformat(),
     }
     return state
@@ -298,84 +277,114 @@ def close_position(
     book_data: dict | None = None,
     skip_slippage: bool = False,
 ) -> dict:
-    """Close the active paper trading position.
+    """Close the active futures position and settle PnL.
 
-    Resolution modes:
-      - result == "WIN"  : market resolved for our side → each token pays $1
-      - result == "LOSS" : market resolved against us   → each token pays $0
-      - result == "SL" or "TP" : early exit — sell tokens at exit_price with slippage
-      - result == "TIME_STOP"     : early exit — position timed out (dead market)
-      - result == "REVERSE_CLOSE" : early exit — opposite MACD signal detected
+    Paper mode: computes PnL locally, updates balance, appends to trade history.
+    Live mode:  delegates to binance_client (not yet implemented).
 
-    skip_slippage=True bypasses _simulate_fill_price() and uses exit_price directly.
-    Use this for Hard TP (Maker limit order — no slippage by definition).
+    Result types:
+      "SL"           : Stop-Loss hit
+      "TP"           : Take-Profit hit (pass skip_slippage=True for limit TP)
+      "TIME_STOP"    : Position closed by time-stop (dead-zone exit)
+      "MAX_HOLD"     : Position exceeded max_hold_time_minutes (safety)
+      "REVERSE_CLOSE": Opposite signal detected — close before reversing
 
-    PnL = (qty * resolution_price) - filled_size_usd
+    Futures PnL math:
+      LONG:  PnL_gross = (exit_price - entry_price) * qty
+      SHORT: PnL_gross = (entry_price - exit_price) * qty
+      Fee   = fee_pct * actual_exit_price * qty  (on exit notional)
+      Net PnL = PnL_gross - Fee
 
-    TX drop simulation applies to SL/TP/TIME_STOP/REVERSE_CLOSE (user-initiated sell txs).
-    WIN/LOSS/DRAW are on-chain resolutions and always succeed.
+    Balance on close: balance += size_usd + net_pnl
+    (size_usd deducted on open is returned; net_pnl may be negative on loss)
+
+    Exit slippage direction:
+      LONG  close → selling  → is_buy=False (price pushed DOWN)
+      SHORT close → buyback  → is_buy=True  (price pushed UP)
+
+    Prop Firm Daily Drawdown Guard:
+      After updating daily_pnl, if daily_pnl <= -(initial_balance_usd * max_daily_loss_pct),
+      trading_halted_until is set to 00:00 UTC of the next calendar day.
+      Uses initial_balance_usd (fixed at session start) — prop firm standard.
     """
+    mode = _get_execution_mode(cfg)
+    if mode == "live":
+        # TODO(live): route to binance_client for close-by-opposite-market-order.
+        raise NotImplementedError(
+            "Live execution not yet implemented — finish binance_client.py to enable."
+        )
+
     portfolio = state["virtual_portfolio"]
     position  = portfolio.get("active_position")
     if position is None:
-        return state
-
-    # Simulate Polygon tx drop for user-initiated exits only
-    if result in ("SL", "TP", "TIME_STOP", "REVERSE_CLOSE") and _tx_dropped(cfg):
-        import logging
-        logging.getLogger(__name__).warning(
-            "TX_DROP: close_position (%s) tx rejected. Position stays open.", result
-        )
         return state
 
     fee_pct     = float(cfg.get("simulation", {}).get("fee_simulation_pct", 0.0))
     entry_price = position["entry_price"]
     size_usd    = position["size_usd"]
     qty         = position.get("qty", size_usd / entry_price)
+    side        = position.get("side", "LONG")
 
-    if result == "WIN":
-        resolution_price = 1.0
-    elif result == "LOSS":
-        resolution_price = 0.0
+    # Exit direction: LONG closes by selling (is_buy=False), SHORT buys back (is_buy=True)
+    is_buy_close = (side == "SHORT")
+    if skip_slippage:
+        actual_exit_price = exit_price
     else:
-        # SL, TP, TIME_STOP, or REVERSE_CLOSE: early exit — sell tokens at exit_price
-        # Hard TP uses exact limit price, others apply slippage
-        if skip_slippage:
-            resolution_price = exit_price
-        else:
-            resolution_price = _simulate_fill_price(
-                exit_price, size_usd, book_data, cfg, is_buy=False
-            )
+        actual_exit_price = _simulate_fill_price(
+            exit_price, size_usd, book_data, cfg, is_buy=is_buy_close
+        )
 
-    gross_return = qty * resolution_price
-    fee          = gross_return * fee_pct
-    net_return   = gross_return - fee
-    pnl          = net_return - size_usd
+    # Futures PnL: direction-aware
+    if side == "LONG":
+        pnl_gross = (actual_exit_price - entry_price) * qty
+    else:  # SHORT
+        pnl_gross = (entry_price - actual_exit_price) * qty
 
-    portfolio["balance_usd"] += net_return
-    portfolio["daily_pnl"]   += pnl
+    # Fee on exit notional volume
+    fee     = fee_pct * actual_exit_price * qty
+    net_pnl = pnl_gross - fee
+
+    # Return the deducted margin + net PnL (can be negative on a losing trade)
+    portfolio["balance_usd"] += size_usd + net_pnl
+    portfolio["daily_pnl"]   += net_pnl
+
+    # ── Prop Firm Daily Drawdown Guard ───────────────────────────────────────
+    # Threshold anchored to initial_balance_usd (fixed), not current equity.
+    # If daily_pnl breaches the limit, halt until 00:00 UTC next day.
+    risk_cfg           = cfg.get("risk_management", {})
+    initial_balance    = float(risk_cfg.get("initial_balance_usd", 1000.0))
+    max_daily_loss_pct = float(risk_cfg.get("max_daily_loss_pct", 0.04))
+    max_daily_loss_usd = initial_balance * max_daily_loss_pct
+
+    if portfolio["daily_pnl"] <= -max_daily_loss_usd:
+        now           = datetime.now(timezone.utc)
+        next_midnight = (now + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        portfolio["trading_halted_until"] = next_midnight.isoformat()
+    # ─────────────────────────────────────────────────────────────────────────
 
     state["trade_history"].append({
         "id":                  position["id"],
         "timestamp":           datetime.now(timezone.utc).isoformat(),
-        "market_id":           position["market_id"],
-        "side":                position["side"],
+        "symbol":              position.get("symbol", ""),
+        "side":                side,
         "entry_price":         entry_price,
-        "qty":                 round(qty, 4),
-        "exit_price":          resolution_price,
+        "qty":                 round(qty, 6),
+        "exit_price":          round(actual_exit_price, 4),
         "size_usd":            size_usd,
         "fill_pct":            position.get("fill_pct", 1.0),
         "sl_pct":              position.get("sl_pct"),
         "tp_pct":              position.get("tp_pct"),
         "trailing_stop_price": position.get("trailing_stop_price"),
-        "pnl":                 round(pnl, 4),
+        "breakeven_activated": position.get("breakeven_activated", False),
+        "pnl":                 round(net_pnl, 4),
         "result":              result,
     })
 
     if result == "SL":
         portfolio["last_sl_timestamp"] = datetime.now(timezone.utc).isoformat()
 
-    # Append trade to CSV log
     _append_trade_csv(state["trade_history"][-1], cfg)
 
     portfolio["active_position"] = None
@@ -391,9 +400,9 @@ def _append_trade_csv(trade: dict, cfg: dict) -> None:
         os.path.join(os.path.dirname(__file__), "..", "data", log_file)
     )
     fields = [
-        "timestamp", "side", "result", "entry_price", "exit_price",
+        "timestamp", "symbol", "side", "result", "entry_price", "exit_price",
         "size_usd", "qty", "fill_pct", "sl_pct", "tp_pct",
-        "pnl", "trailing_stop_price",
+        "pnl", "trailing_stop_price", "breakeven_activated",
     ]
     file_exists = os.path.isfile(csv_path)
     with open(csv_path, "a", newline="", encoding="utf-8") as f:
